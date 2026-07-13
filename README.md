@@ -2,7 +2,7 @@
 
 A lightweight, high-performance, and ultra-secure Public Key Infrastructure (PKI) designed for modern cloud-native, on-premise, and edge environments. **FastPKI** combines enterprise-grade security—including Post-Quantum Cryptography (PQC) and Hardware Security Module (HSM) support—with a tiny footprint and effortless management.
 
-> ⚡ **Ultra-Lightweight & Blazing Fast:** Native code running at 2-4MB per binary with minimal resource footprint and multi-threaded throughput.
+> ⚡ **Ultra-Lightweight & Blazing Fast:** Native code running at 8-10MB per binary with minimal resource footprint and multi-threaded throughput.
 
 ---
 

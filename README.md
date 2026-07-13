@@ -15,7 +15,7 @@ A lightweight, high-performance, and ultra-secure Public Key Infrastructure (PKI
 * **Flexible Environments:** Deploy natively on-premise, in the cloud via VM services, or as highly orchestrated Kubernetes workloads.
 
 ### ⚡ Performance & Scalability
-* **Micro Footprint:** Extremely optimized native code using just **2–4MB of RAM per binary**, making it perfect for edge devices and micro-containers.
+* **Micro Footprint:** Extremely optimized native code using just **8-10MB of RAM per binary**, making it perfect for edge devices and micro-containers.
 * **Horizontal Scalability:** Multi-threaded performance built to scale horizontally across global clusters.
 * **Autonomous Edge (Split-Brain Resilience):** Data centers function completely autonomously while disconnected. Databases automatically sync and reconcile conflicts seamlessly once connectivity is restored.
 

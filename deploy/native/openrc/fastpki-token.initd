@@ -1,0 +1,163 @@
+#!/sbin/openrc-run
+# OpenRC service — the token provider, served out of process by p11-kit.
+#
+# ⚠️ NAMED FOR WHAT IT PROVIDES, NOT HOW. Every FastPKI service depends on one thing from
+# it — that the token socket exists. The bundled SoftHSM satisfies that today and a vendor
+# PKCS#11 module is loaded directly instead, so the name says what dependants need rather
+# than which implementation is behind it.
+#
+# ⚠️ THIS SOCKET IS ALWAYS THIS NODE'S OWN TOKEN. Every node has its own token in every
+# deployment shape; there is no arrangement in which ${P11_SOCKET} reaches somebody else's.
+# `P11_TLS` publishes THIS node's token to a peer (fastpki-p11-tls) so a CA private key can
+# be replicated into another node's token — it is not a way to borrow one. Reaching a single
+# remote token would mean losing that host stops every node signing, and certificates issued
+# under its key could never afterwards be renewed or revoked. See docs/architecture.md §4-§6.
+#
+# This is the native equivalent of the `softhsm` service in deploy/docker-compose.yml,
+# and it exists for the same non-negotiable reason: NO FastPKI process may load
+# libsofthsm2.so in-process. SoftHSM's OpenSSL crypto backend re-enters libcrypto while
+# libcrypto holds a lock, and the binary DEADLOCKS — a hang, which is worse than a
+# failure because it never returns. So p11-kit serves the token over a unix socket and
+# every app loads the p11-kit client shim instead.
+#
+# ⚠️ NOT ENABLED FOR KEY_BACKEND=hsm. A vendor PKCS#11 module (CloudHSM, a network HSM,
+# a card) is loaded directly and has no such problem; p11-kit is out of the path
+# entirely, which is the recommended production shape. install-native.sh only enables
+# this service when PKCS11_MODULE is the client shim.
+#
+# Runs as ROOT: it creates /run/p11 and the socket, and hands the socket to the
+# unprivileged runtime user with -u. The token store itself stays root-owned — the
+# fastpki user reaches it only through this process.
+
+: "${FASTPKI_CONF_D:=/etc/conf.d/fastpki}"
+# shellcheck source=/dev/null
+[ -r "$FASTPKI_CONF_D" ] && . "$FASTPKI_CONF_D"
+
+: "${FASTPKI_USER:=fastpki}"
+: "${FASTPKI_LOGDIR:=/var/log/fastpki}"
+: "${SOFTHSM_TOKENDIR:=/var/lib/softhsm/tokens}"
+: "${SOFTHSM_MODULE:=/usr/lib/softhsm/libsofthsm2.so}"
+: "${P11_SOCKET_DIR:=/run/p11}"
+: "${P11_SOCKET:=${P11_SOCKET_DIR}/pkcs11.sock}"
+: "${P11_KIT_SERVER:=/usr/libexec/p11-kit/p11-kit-server}"
+: "${PKCS11_TOKEN:=fastpki}"
+
+name="FastPKI SoftHSM token server"
+description="Serves the SoftHSM token over p11-kit so no app loads it in-process"
+command="$P11_KIT_SERVER"
+command_args="-f -n ${P11_SOCKET} -u ${FASTPKI_USER} --provider ${SOFTHSM_MODULE} pkcs11:"
+
+supervisor=supervise-daemon
+pidfile="/run/supervise-${RC_SVCNAME}.pid"
+respawn_delay=2
+# Unlimited, for the same reason as the protocol services: if this process is restarted
+# the apps notice their dead handles and exit(0) to be respawned with fresh ones. Both
+# halves of that recovery have to be unbounded or the deployment ends up half-up.
+respawn_max=0
+output_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+error_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+
+# ⚠️ A CEILING ON HOW MANY PROCESSES THIS SERVER CAN CREATE, so that a client which leaks
+# sessions cannot take the machine with it.
+#
+# p11-kit-server forks a p11-kit-remote per client connection. A caller that opens sessions
+# and never closes them therefore multiplies processes, and each one costs about 1.4 MB.
+# Measured on a 924 MB node: 516 and 616 of them on the two servers of a deployment, 829 MB
+# used, 7 MB free, and the kernel then killed PostgreSQL — after which every service
+# restarted forever against a database that could not come back. The node needed hands.
+#
+# ⚠️ A CGROUP, NOT `ulimit -u`. RLIMIT_NPROC counts every process of the forking process's
+# real uid — and this server runs as root, which already has about 90 processes on an idle
+# node. A limit low enough to be useful would refuse forks that have nothing to do with the
+# token, and one high enough to be safe would not bound anything. The cgroup counts this
+# service's own processes and nothing else.
+#
+# 128 against a normal 8 to 29 remotes: roughly four times the working set, and about
+# 180 MB if it were ever reached. Past it a new session fails and the caller sees an error,
+# which is a page in the console reporting a problem instead of a machine that stops.
+#
+# Needs cgroups v2 mounted; install-native.sh enables OpenRC's `cgroups` service and sets
+# rc_cgroup_mode="unified" in /etc/rc.conf. Without them OpenRC skips this silently, which
+# is why the installer does it rather than leaving it to the image.
+#
+# ⚠️ WHAT REACHING THE CEILING ACTUALLY DOES, because it is not an error message. The server
+# accepts the connection and then cannot fork, so the client waits — and a caller blocked on
+# a session never returns. Measured: a console whose node report could not get a session sat
+# on "Loading dashboard…" for ever, because one of the four requests it waits for never
+# came back.
+#
+# That is still the better failure of the two on offer. Without the ceiling the same leak
+# fills the machine, the kernel kills PostgreSQL, and the node needs the repair sequence in
+# docs/deployment.md §13. With it the machine stays up, the database keeps serving, and
+# `rc-service fastpki-token restart` frees every session in a second — the listeners notice
+# their dead handles and are respawned with fresh ones, which is what §7.1's design is for.
+#
+# So: a ceiling that hangs one page beats a leak that takes the host, and the real answer is
+# that nothing should be leaking sessions. One that was — listing the token opened a new
+# connection per call and never closed it — is fixed in pkcs11_list_objects().
+rc_cgroup_settings="pids.max 128"
+
+depend() {
+    need localmount
+    before fastpki-ocsp fastpki-est fastpki-acme fastpki-cmp fastpki-ms fastpki-scep \
+           fastpki-store fastpki-web
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o root:root "$P11_SOCKET_DIR" || return 1
+    checkpath -d -m 0750 -o "${FASTPKI_USER}:${FASTPKI_USER}" "$FASTPKI_LOGDIR" || return 1
+
+    # ⚠️ mkdir -p FIRST. checkpath does not create PARENT directories, so on a host where
+    # /var/lib/softhsm does not exist it fails with "could not open softhsm: No such file
+    # or directory" — naming the parent, from a service that only ever mentions the child.
+    # The bake creates both; this keeps the service correct on a host assembled some other
+    # way, and checkpath still owns the mode and ownership.
+    mkdir -p "$SOFTHSM_TOKENDIR" || return 1
+    checkpath -d -m 0700 -o root:root "$SOFTHSM_TOKENDIR" || return 1
+
+    # SOFTHSM2_CONF is written here rather than relied on from /etc, so this service and
+    # the softhsm2-util call below can never disagree about where the tokens live.
+    SOFTHSM2_CONF="${P11_SOCKET_DIR}/softhsm2.conf"
+    export SOFTHSM2_CONF
+    printf 'directories.tokendir = %s\nobjectstore.backend = file\nlog.level = ERROR\n' \
+        "$SOFTHSM_TOKENDIR" > "$SOFTHSM2_CONF"
+
+    # First boot initialises the token. Idempotent: a token that already carries the
+    # label is left strictly alone — re-initialising it would destroy every CA key on
+    # this node, which is the one irreversible thing in the whole install.
+    if ! softhsm2-util --show-slots 2>/dev/null | grep -qi "label:.*${PKCS11_TOKEN}"; then
+        if [ -z "${FASTPKI_PIN:-}" ]; then
+            eerror "no token and no FASTPKI_PIN in ${FASTPKI_CONF_D} — cannot initialise"
+            eerror "token '${PKCS11_TOKEN}'. Re-run deploy/native/install-native.sh."
+            return 1
+        fi
+        einfo "initialising SoftHSM token '${PKCS11_TOKEN}'"
+        softhsm2-util --init-token --free --label "$PKCS11_TOKEN" \
+            --so-pin "${HSM_SO_PIN:-$FASTPKI_PIN}" --pin "$FASTPKI_PIN" || return 1
+    fi
+
+    # A socket left behind by an unclean stop makes bind() fail with EADDRINUSE, and the
+    # supervisor would respawn into the same error forever.
+    [ -S "$P11_SOCKET" ] && rm -f "$P11_SOCKET"
+    return 0
+}
+
+start_post() {
+    # OpenRC considers a supervise-daemon service started as soon as the process is
+    # LAUNCHED, which is not the same as the socket existing — and every dependent
+    # service's first act is to open that socket. compose expresses this as a
+    # healthcheck plus `condition: service_healthy`; here it is an explicit wait.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        [ -S "$P11_SOCKET" ] && return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    eerror "p11-kit did not create ${P11_SOCKET} within 30s — see ${error_log}"
+    return 1
+}
+
+stop_post() {
+    rm -f "$P11_SOCKET"
+    return 0
+}

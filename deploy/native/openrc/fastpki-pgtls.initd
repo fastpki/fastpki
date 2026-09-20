@@ -1,0 +1,32 @@
+#!/sbin/openrc-run
+# OpenRC service — watches for a replacement PostgreSQL TLS certificate and installs it.
+#
+# The compose stack runs this as a backgrounded loop inside the postgres service's own
+# command, because compose has nowhere else to put it. Natively it is its own supervised
+# process, which also means `rc-service fastpki-pgtls status` answers whether certificate
+# rotation is actually running — in compose that is invisible.
+#
+# See /usr/libexec/fastpki/pg-tls-sync (deploy/native/pg-tls-sync.sh) for why PostgreSQL
+# reads a copy rather than the published file.
+
+name="FastPKI PostgreSQL TLS sync"
+description="Adopts a CA-issued PostgreSQL certificate written by the console"
+
+command=/usr/libexec/fastpki/pg-tls-sync
+command_args="follow"
+
+supervisor=supervise-daemon
+pidfile="/run/supervise-${RC_SVCNAME}.pid"
+respawn_delay=10
+respawn_max=0
+output_log=/var/log/fastpki/fastpki-pgtls.log
+error_log=/var/log/fastpki/fastpki-pgtls.log
+
+depend() {
+    need postgresql
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o fastpki:fastpki /var/log/fastpki || return 1
+    return 0
+}

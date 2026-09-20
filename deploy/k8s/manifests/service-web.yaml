@@ -1,0 +1,20 @@
+# The console, across every server. Sessions live in the database, so a request may land on
+# either pod — which is also why the console's forms work from whichever pod served the page.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastpki-web
+  labels:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: web
+spec:
+  type: "$WEB_SERVICE_TYPE"
+  selector:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: node
+  ports:
+    - port: $WEB_PORT
+      targetPort: $WEB_PORT
+      protocol: TCP

@@ -1,0 +1,189 @@
+############### FastPKI Demo (Manual) ##############
+
+export PKI_DNS=localhost
+# or
+#export PKI_DNS=pki.example.org
+
+##### CRL staging — paste this once, every -crl_check_all below uses it #####
+
+# -crl_check_all wants a CRL for EVERY certificate in the chain, the root included. A root
+# carries no CRL DP of its own — a trust anchor has no issuer to point at — so
+# -crl_download has nothing to fetch for it and OpenSSL 3.5 stops with
+# "unable to get certificate CRL" at the root's depth. (OpenSSL 3.6 no longer asks; see
+# openssl/openssl#8439.) Stage the CRLs into a hashed directory instead. They stay out of
+# the -CAfile, which carries trust anchors and nothing else.
+#
+# Every CRL needed is named inside the chain itself: the leaf's DP points at the issuing
+# CA's CRL, and the issuing CA's DP points at the root's — which also covers the root.
+# Re-run it before each check: after a revocation you want the NEW list, and the responder
+# may cache the old one for CRL_CACHE_TTL_SEC (300 s by default).
+stage_crls() {   # stage_crls <pem> [pem …]   — fills ./crls for -CApath crls
+  rm -rf crls && mkdir -p crls
+  awk '/BEGIN CERT/{n++} n{print > ("crls/c" n ".pem")}' "$@"
+  for c in crls/c*.pem; do
+    for u in $(openssl x509 -in "$c" -noout -ext crlDistributionPoints 2>/dev/null \
+               | sed -n 's/.*URI:\(http[^ ]*\).*/\1/p'); do
+      curl -s --max-time 10 "$u" -o crls/dl.crl \
+        && h=$(openssl crl -in crls/dl.crl -inform DER -noout -hash 2>/dev/null) \
+        && openssl crl -in crls/dl.crl -inform DER -out "crls/$h.r0" && break
+    done
+  done
+  rm -f crls/c*.pem crls/dl.crl
+}
+
+### Transport cert validation for web, EST, ACME, MS (download root CA from web console and save it in root-ca.crt) ###
+
+openssl s_client -showcerts -servername ${PKI_DNS} -connect ${PKI_DNS}:8090 </dev/null 2>/dev/null > served.pem
+stage_crls served.pem
+
+openssl s_client -CAfile root-ca.crt -CApath crls -servername ${PKI_DNS} -x509_strict -crl_check_all -connect ${PKI_DNS}:8090
+openssl s_client -CAfile root-ca.crt -CApath crls -servername ${PKI_DNS} -x509_strict -crl_check_all -connect ${PKI_DNS}:8443
+openssl s_client -CAfile root-ca.crt -CApath crls -servername ${PKI_DNS} -x509_strict -crl_check_all -connect ${PKI_DNS}:8444
+openssl s_client -CAfile root-ca.crt -CApath crls -servername ${PKI_DNS} -x509_strict -crl_check_all -connect ${PKI_DNS}:8446
+
+##### Private Key generation #####
+
+# RSA
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out rsa.key
+
+# RSA-PSS
+openssl genpkey -algorithm RSA-PSS -pkeyopt rsa_keygen_bits:2048 -out rsa.key
+
+# EC
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -pkeyopt ec_param_enc:named_curve -out ec.key
+
+# ED
+openssl genpkey -algorithm ED25519 -out ed.key
+
+# ML-DSA
+openssl genpkey -algorithm ML-DSA-65 -out ml-dsa.key
+
+##### CSR creation #####
+openssl req -new -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -key rsa.key -out example.com.req
+openssl req -in example.com.req -noout -text
+
+##### EST certificate management protocol (RFC 7030) #####
+export CA_ID=sub-ca
+
+curl -k https://${PKI_DNS}:8443/.well-known/est/${CA_ID}/cacerts | openssl base64 -d -A | openssl pkcs7 -inform der -print_certs -quiet -out cacerts.crt
+
+curl -v --cacert cacerts.crt --user alice --data-binary @example.com.req -H "Content-Type: application/pkcs10" https://${PKI_DNS}:8443/.well-known/est/${CA_ID}/simpleenroll | openssl base64 -d -A | openssl pkcs7 -inform der -print_certs -out example.com.crt
+
+# display new cert info
+openssl x509 -in example.com.crt -noout -text
+
+# issued cert verification CRL and OCSP checks
+stage_crls cacerts.crt example.com.crt
+openssl verify -CAfile cacerts.crt -CApath crls -x509_strict -crl_check_all example.com.crt
+openssl ocsp -url http://${PKI_DNS}:8080/ocsp -issuer cacerts.crt -CAfile cacerts.crt -cert example.com.crt
+
+##### CMP (obtain fastpki-cmp.cnf from web console and update trusted to cacerts.crt if needed, RFC 9810) ####
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -pkeyopt ec_param_enc:named_curve -out example.com.key
+openssl cmp -config fastpki-cmp.cnf -section cmp,ir -sans example.com
+
+# issued cert verification CRL and OCSP checks
+stage_crls cacerts.crt example.com.crt
+openssl verify -CAfile cacerts.crt -CApath crls -x509_strict -crl_check_all example.com.crt
+openssl ocsp -url http://${PKI_DNS}:8080/ocsp -issuer cacerts.crt -CAfile cacerts.crt -cert example.com.crt
+
+openssl cmp -config fastpki-cmp.cnf -section cmp,kur
+
+openssl cmp -config fastpki-cmp.cnf -section cmp,rr -revreason 4 # superseded (0 - unspecified, 1 - key compromised, see doc for others)
+
+# revoked cert verification CRL and OCSP checks
+stage_crls cacerts.crt example.com.crt
+openssl verify -CAfile cacerts.crt -CApath crls -x509_strict -crl_check_all example.com.crt
+openssl ocsp -url http://${PKI_DNS}:8080/ocsp -issuer cacerts.crt -CAfile cacerts.crt -cert example.com.crt
+
+##### ACME (download certbot-cli.ini and root CA cert, root-ca.crt, from web console. Ensure nginx is listening on port 80 and find its root dir for --nginx-server-root arg, RFC 8555) #####
+
+netstat -nap tcp | grep "\.80\ "
+sudo nginx -t
+
+### Automatic cert request using a single command and nginx plugin (account registration is included) ###
+
+# cert request
+# normally one would use "certbot run" command to install the cert in nginx instead of "certbot certonly" to get the cert without installation
+export REQUESTS_CA_BUNDLE=root-ca.crt 
+sudo -E certbot certonly --config certbot-cli.ini --nginx --nginx-server-root /opt/homebrew/etc/nginx -d aps-macbook-air.local
+
+# list issued certs
+sudo certbot certificates --config certbot-cli.ini
+
+# issued cert verification CRL and OCSP checks
+sudo cat /etc/letsencrypt/live/aps-macbook-air.local/fullchain.pem > acme-fullchain.pem
+stage_crls cacerts.crt acme-fullchain.pem
+openssl verify -CAfile cacerts.crt -CApath crls -x509_strict -crl_check_all acme-fullchain.pem
+sudo openssl ocsp -url http://${PKI_DNS}:8080/ocsp -issuer cacerts.crt -CAfile cacerts.crt -cert /etc/letsencrypt/live/aps-macbook-air.local/fullchain.pem
+
+# renew cert
+sudo -E certbot renew --config certbot-cli.ini --force-renewal --cert-name aps-macbook-air.local
+
+# cert revoke
+sudo -E certbot revoke --config certbot-cli.ini --cert-name aps-macbook-air.local
+
+# revoked cert verification CRL and OCSP checks (do not delete the cert! otherwise verification won't work!)
+sudo cat /etc/letsencrypt/live/aps-macbook-air.local/fullchain.pem > acme-fullchain.pem
+stage_crls cacerts.crt acme-fullchain.pem
+openssl verify -CAfile cacerts.crt -CApath crls -x509_strict -crl_check_all acme-fullchain.pem
+sudo openssl ocsp -url http://${PKI_DNS}:8080/ocsp -issuer cacerts.crt -CAfile cacerts.crt -cert  /etc/letsencrypt/live/aps-macbook-air.local/fullchain.pem
+
+
+### Manual ACME ops for illustration purpose only ###
+
+# account registration
+sudo -E certbot register --config certbot-cli.ini
+
+# cert request
+sudo -E certbot certonly --manual --config certbot-cli.ini -d aps-macbook-air.local
+
+# follow the instructions to validate the challenge
+
+# account deactivation
+sudo -E certbot unregister --config certbot-cli.ini
+
+
+##### MS CEP/CES (MS-XCEP/MS-WSTEP) ######
+
+# To add policy server from PowerShell, run as Domain Administrator (local Administrator won't have TGT):
+$PKI_DNS = "pki.example.com"
+$CA_ID = "sub-ca"
+
+
+$PKI_DNS = "pki.example.com"
+$CA_ID = "CA01"
+
+Add-CertificateEnrollmentPolicyServer -Url https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -Context User -AutoEnrollmentEnabled -RequireStrongValidation
+Add-CertificateEnrollmentPolicyServer -Url https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -Context Machine -AutoEnrollmentEnabled -RequireStrongValidation
+
+# To verify it from PowerShell
+Get-CertificateEnrollmentPolicyServer -Scope All -Context User
+Get-CertificateEnrollmentPolicyServer -Scope All -Context Machine
+
+# To delete the policy
+Remove-CertificateEnrollmentPolicyServer -Url https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -Context User
+Remove-CertificateEnrollmentPolicyServer -Url https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -Context Machine
+
+# delete the stale machine policy cache file if machine enrolment fails (i.e. cannot find templates or similar)
+certutil -PolicyCache delete
+
+# delete the stale user policy cache file if user enrolment fails (i.e. cannot find templates or similar)
+certutil -PolicyCache -User delete
+
+# display the policy and templates 
+certutil -PolicyServer https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -Kerberos -Policy
+certutil -PolicyServer https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -Kerberos -Template
+
+# -policyserver * will prompt to select the Policy Server from a GUI menu
+certreq -enroll -policyserver * -user UserSignature
+certreq -enroll -policyserver * -user ExchangeUserSignature
+certreq -enroll -policyserver * -machine Machine
+
+# explicit policy server
+certreq -enroll -policyserver https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -user UserSignature
+certreq -enroll -policyserver https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -user ExchangeUserSignature
+certreq -enroll -policyserver https://$(${PKI_DNS}):8446/msxcep/${CA_ID} -machine Computer
+
+# MS validation (<cert_id> can be fingerprint or serial - both are printed out by the above commands)
+certutil -user -store My <cert_id> "${TEMP}\temp.cer"
+certutil -urlfetch -verify "${TEMP}\temp.cer"

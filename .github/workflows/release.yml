@@ -1,0 +1,238 @@
+# A tag is the release. Everything here is built FROM the tag, so the version a binary
+# reports is the version somebody downloaded.
+#
+# ⚠️ THE VERSION COMES FROM `git describe`, WHICH NEEDS THE TAGS AND THE HISTORY.
+# CMakeLists derives FASTPKI_VERSION that way and falls back to `0.0.0-dev` when it finds
+# nothing — and actions/checkout defaults to a SHALLOW clone with no tags, which produces
+# exactly that fallback. A release whose binaries report `0.0.0-dev` is the failure this
+# workflow exists to prevent, so fetch-depth: 0 below is load-bearing, not tidiness.
+#
+# ⚠️ TWO ARCHITECTURES, BUILT NATIVELY, MERGED INTO ONE TAG. This published amd64 alone for
+# its whole life, silently: `docker build` with no --platform produces a single-arch
+# manifest, and an Apple Silicon or Graviton host then pulls it into emulation without
+# saying so. arm64 was never broken — it builds clean and passes the suite — it was simply
+# never published.
+#
+# Built on two native runners rather than one with QEMU, because the Dockerfile compiles
+# p11-kit, SoftHSM, pkcs11-provider AND FastPKI from source; emulating that turns minutes
+# into an hour or more. The cost is a requirement: `ubuntu-24.04-arm` is free on a PUBLIC
+# repository and needs a paid plan on a private one. If the arm leg cannot start, this
+# workflow FAILS rather than quietly shipping amd64 alone again — which is the whole
+# failure being fixed.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write        # create the release and upload assets
+  packages: write        # push the image to GHCR
+
+jobs:
+  # Resolved once and shared, so the two image jobs and the publish job cannot disagree
+  # about what is being released.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0        # tags + history, or the version is 0.0.0-dev
+      - name: Resolve the version
+        id: v
+        run: |
+          set -eu
+          VER=$(git describe --tags --always --dirty)
+          case "$VER" in
+            *-dirty) echo "refusing: working tree is dirty ($VER)" >&2; exit 1;;
+            v*)      ;;
+            *)       echo "refusing: not built from a tag ($VER)" >&2; exit 1;;
+          esac
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Building $VER"
+
+  image:
+    needs: version
+    strategy:
+      fail-fast: false       # one arch failing should still show the other's result
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Build the image
+        run: |
+          set -eu
+          V=${{ needs.version.outputs.version }}
+          docker build -t "fastpki:$V" \
+                       --build-arg CMAKE_EXTRA_FLAGS="-DFASTPKI_VERSION=$V" .
+
+      # ⚠️ NOW CHECKED ON EVERY ARCHITECTURE, NOT JUST THE ONE THAT HAPPENED TO BUILD FIRST.
+      # A release that ships binaries reporting a different version than the tag is worse
+      # than no release: every bug report after it names the wrong build. Each runner is
+      # native, so this runs the real binary rather than an emulated one.
+      - name: The binaries report the version they were tagged with
+        run: |
+          set -eu
+          V=${{ needs.version.outputs.version }}
+          GOT=$(docker run --rm "fastpki:$V" fastpki-web --version 2>&1 | head -1)
+          echo "${{ matrix.arch }}: fastpki-web --version -> $GOT"
+          case "$GOT" in
+            *"$V"*) ;;
+            *) echo "refusing: binary reports '$GOT', tag is $V" >&2; exit 1;;
+          esac
+
+      # ⚠️ LOWERCASE, AND NOT github.repository VERBATIM. A GHCR path must be lowercase, so
+      # the obvious spelling does not merely fail to authenticate — it is not a parseable
+      # reference and `docker tag` refuses before anything reaches the network:
+      #   invalid reference format: repository name (owner/FastPKI) must be lowercase
+      - name: Push the per-architecture tag
+        run: |
+          set -eu
+          V=${{ needs.version.outputs.version }}
+          IMG="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag "fastpki:$V" "$IMG:$V-${{ matrix.arch }}"
+          docker push "$IMG:$V-${{ matrix.arch }}"
+
+  publish:
+    needs: [version, image]
+    # ⚠️ RUNS EVEN IF AN ARCHITECTURE FAILED, and that is deliberate. With a plain `needs`
+    # a single failed matrix leg skips this job entirely — no image tag, no tarball, no
+    # SHA256SUMS, no release at all. ubuntu-24.04-arm is free only on a PUBLIC repository,
+    # so on a private one the arm leg cannot start and a release that is otherwise perfect
+    # would produce nothing. It publishes what exists and NAMES what it published; the
+    # honesty is in the release notes rather than in refusing.
+    if: always() && needs.version.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # The per-arch tags stay published on purpose: they are what the manifest points at,
+      # and they make "which arch is broken" answerable without pulling a manifest apart.
+      - name: Merge the architectures into one tag
+        run: |
+          set -eu
+          V=${{ needs.version.outputs.version }}
+          IMG="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          # Only the per-arch tags that actually got pushed. A leg that could not run leaves
+          # no tag, and a manifest naming a missing one fails outright — so probe, do not
+          # assume both.
+          ARCHES=""
+          for a in amd64 arm64; do
+              if docker manifest inspect "$IMG:$V-$a" >/dev/null 2>&1; then
+                  ARCHES="${ARCHES:+$ARCHES }$a"
+              else
+                  echo "::warning::no $a image for $V — it will not be in the manifest"
+              fi
+          done
+          [ -n "$ARCHES" ] || { echo "refusing: no architecture built for $V" >&2; exit 1; }
+          SRC=""; for a in $ARCHES; do SRC="$SRC $IMG:$V-$a"; done
+          # ⚠️ A CANDIDATE MUST NOT MOVE `latest`. rc6 shipped a console that could not
+          # parse at all, and it published as both v0.1.0-rc6 AND latest, so an unpinned
+          # `docker pull` served the dead build by default. Nothing we ship pulls GHCR
+          # latest -- every :latest in the docs and deploy scripts names a local or lab
+          # registry -- so withholding it from a candidate costs nothing and removes the
+          # only way an unversioned pull can land on one.
+          TAGS="$V"
+          case "$V" in *-rc*|*-alpha*|*-beta*) echo "$V is a candidate: not moving latest" ;;
+                        *) TAGS="$V latest" ;; esac
+          for t in $TAGS; do
+              # shellcheck disable=SC2086
+              docker manifest create --amend "$IMG:$t" $SRC
+              docker manifest push "$IMG:$t"
+          done
+          docker manifest inspect "$IMG:$V" | grep -E '"architecture"'
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          echo "ARCHES=$ARCHES" >> "$GITHUB_ENV"
+
+      - name: Source tarball and checksums
+        run: |
+          set -eu
+          mkdir -p dist
+          V=${{ needs.version.outputs.version }}
+          # git archive, not tar of the working tree: it contains exactly what the tag
+          # contains, with no build output and nothing gitignored riding along.
+          git archive --format=tar.gz --prefix="fastpki-$V/" -o "dist/fastpki-$V.tar.gz" "$V"
+          # An image tarball PER ARCHITECTURE, each named for the one it holds. Shipping
+          # only amd64 made the offline path — load the tarball rather than compile four
+          # C/C++ projects on a small server — available to one architecture and not the
+          # other, while the registry carried both. Someone on arm64 with no registry access
+          # had no route at all, which is precisely the case the tarball exists for.
+          #
+          # ⚠️ --platform IS REQUIRED. This job runs on an amd64 runner, and pulling a
+          # single-arch arm64 tag without it fails with "no matching manifest for
+          # linux/amd64" — the arm64 asset would then be missing on every release, exactly
+          # as it was, and the failure names the manifest rather than the platform flag.
+          for A in amd64 arm64; do
+            docker pull --platform "linux/$A" "$IMG:$V-$A"
+            docker save "$IMG:$V-$A" | gzip > "dist/fastpki-$V-image-$A.tar.gz"
+          done
+          # ⚠️ THE INSTALLER ITSELF IS AN ASSET. The documented one-liner fetches
+          # <release>/install.sh, and it was never published — so the command in the guide
+          # asked for a file no release had. Checksummed alongside the tarballs so somebody
+          # piping it to a shell can at least verify it out of band first.
+          cp deploy/install.sh dist/install.sh
+          ( cd dist && sha256sum ./*.tar.gz ./install.sh > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          V=${{ needs.version.outputs.version }}
+          {
+            echo "## FastPKI $V"
+            echo
+            _disp=""; for a in $ARCHES; do _disp="${_disp:+$_disp, }linux/$a"; done
+            echo "Container image — $_disp:"
+            echo '```'
+            echo "docker pull $IMG:$V"
+            echo '```'
+            echo
+            case "$ARCHES" in
+              *arm64*) : ;;
+              *) echo "⚠️ This release is **amd64 only** — the arm64 build did not run." ;;
+            esac
+            echo
+            # ⚠️ ONE TARBALL PER ARCHITECTURE is attached, and has been since 979f982 added the
+            # arm64 build. This sentence still said "amd64 only" for three releases after that,
+            # denying an asset the release actually carried — the conditional warning above was
+            # updated and this line was not. Say what is attached in terms of $ARCHES, so the
+            # next architecture change cannot falsify it again.
+            echo "An image tarball is attached for each architecture above, for \`docker load\` on"
+            echo "a host with no registry access. The registry serves the same images behind one"
+            echo "multi-architecture manifest, so \`docker pull\` selects the right one."
+            echo
+            echo "Install with one command:"
+            echo '```'
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/download/$V/install.sh | bash"
+            echo '```'
+            echo
+            echo "Verify a download against \`SHA256SUMS\`:"
+            echo '```'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo
+            echo "Licensed under PolyForm Noncommercial 1.0.0 — see LICENSE.md."
+          } > notes.md
+          gh release create "$V" --title "FastPKI $V" --notes-file notes.md dist/*

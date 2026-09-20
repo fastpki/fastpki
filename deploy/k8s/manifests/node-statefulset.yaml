@@ -1,0 +1,366 @@
+# One FastPKI server per pod — the Kubernetes form of one Compose host.
+#
+# ⚠️ EVERY SERVER HAS ITS OWN TOKEN, ITS OWN /var/pki AND ITS OWN DATABASE, as every node does in
+# every deployment shape (docs/architecture.md §4). The manifests this replaced ran one token
+# Deployment and one Postgres primary for the whole cluster, with every pod mounting a node-local
+# socket claim: the CA keys sat on one node's disk, nothing could be scheduled anywhere else, and
+# losing that node lost the keys and the deployment with them. A storage class that could
+# re-attach the token, or a selector pinning where it ran, still kept ONE copy of every key.
+#
+# So each pod is a whole server, and HA_ENABLED is two of them on two nodes — the Compose pair:
+#
+#   token        sidecar init container: this server's SoftHSM token on its own claim, served on
+#                a socket in an emptyDir that only this pod mounts
+#   init         certgen (PIN file, transport keypair in THIS token, self-signed database
+#                certificate naming this pod), then /var/pki handed to the runtime user
+#   postgres     this server's database: pod 0 initialises the primary, the next seeds from
+#                whichever pod is read-write and streams (start-postgres.sh)
+#   p11-tls      this token over mutual TLS, so the other server can replicate a key into its
+#                own token — never so it can sign with this one
+#   web … scep   every listener, each on localhost beside the rest
+#   renew        Compose's certrenew loop, including `key sync` from the other server
+#
+# The pods are one data center twice. The protocol Services spread across them, which is the one
+# address a pair advertises; the applications' conninfo lists every pod with
+# target_session_attrs=read-write, so a promotion re-homes them with no restart.
+#
+# Sections between `# @if <FLAG>` and `# @end` are removed by apply.sh when the flag is off.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastpki-node
+  labels:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: node
+spec:
+  # Headless, for stable per-pod names: fastpki-node-0.fastpki-node, fastpki-node-1.fastpki-node. Each server's
+  # PG_BIND is its own name, which is what its database certificate certifies and what the other
+  # server dials to seed, stream and replicate keys.
+  clusterIP: None
+  # ⚠️ PUBLISHED BEFORE READY. A standby seeds from the primary before any of its own containers
+  # can be ready, and a pod that is not ready is otherwise absent from DNS — so the join would
+  # wait for a readiness it cannot reach.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: node
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+    - { name: p11-tls, port: 12345, targetPort: 12345 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fastpki-node
+  labels:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: node
+spec:
+  serviceName: fastpki-node
+  replicas: $NODE_COUNT
+  # Parallel: the standby's database waits for a primary by itself (start-postgres.sh), so there
+  # is nothing to gain from making its whole pod wait for pod 0 to be ready.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fastpki
+      app.kubernetes.io/instance: fastpki
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      annotations:
+        # ⚠️ ROLLS THE PODS WHEN THE CONFIG CHANGES. bootstrap.conf is mounted with subPath, and
+        # a subPath ConfigMap mount never receives updates, so without this a changed ConfigMap
+        # reached no running process.
+        fastpki.io/config-hash: "$CONFIG_HASH"
+      labels:
+        app.kubernetes.io/name: fastpki
+        app.kubernetes.io/instance: fastpki
+        app.kubernetes.io/component: node
+    spec:
+      $DIRECTORY_DNS_BLOCK
+      # ⚠️ REQUIRED, NOT PREFERRED. Two servers on one node are one failure domain: they cover a
+      # process dying and nothing else, which is not what a second server is for. A pod left
+      # Pending for want of a second node is visible; one running beside its peer is not.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: fastpki
+                  app.kubernetes.io/component: node
+      initContainers:
+        # @if SOFTHSM
+        # A sidecar (restartPolicy: Always) rather than an ordinary container, so the kubelet
+        # starts it — and waits for its startupProbe — BEFORE the init container below, which
+        # mints this pod's transport keypair inside the token. Needs Kubernetes 1.29 or later.
+        - name: token
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          restartPolicy: Always
+          securityContext:
+            runAsUser: 0
+          command: ["/bin/sh", "/scripts/token.sh"]
+          # ⚠️ A CEILING, so a client that leaks sessions costs this container and not the
+          # node. p11-kit-server forks a p11-kit-remote per connection at about 1.4 MB, and
+          # a caller that never closes one multiplies them — measured at 516 and 616 on the
+          # two servers of a native deployment, which exhausted a 924 MB machine and got
+          # PostgreSQL OOM-killed. Kubernetes has no per-container process limit in the pod
+          # spec (that is a kubelet setting, podPidsLimit), so the bound here is memory: the
+          # token uses 20 MB, and 192Mi is roughly 128 remotes' worth. Reaching it restarts
+          # this container alone. Compose and native bound the process count directly —
+          # pids_limit and rc_ulimit -u, both 128.
+          resources:
+            limits:
+              memory: 192Mi
+          env:
+            - { name: FASTPKI_PIN, valueFrom: { secretKeyRef: { name: fastpki-secret, key: fastpkiPin } } }
+            - { name: SOFTHSM_SO_PIN, valueFrom: { secretKeyRef: { name: fastpki-secret, key: softhsmSoPin } } }
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -S /run/p11/pkcs11.sock"]
+            periodSeconds: 2
+            failureThreshold: 60
+          volumeMounts:
+            - { name: p11-socket, mountPath: /run/p11 }
+            - { name: softhsm-tokens, mountPath: /var/lib/softhsm/tokens }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+        # @end
+        - name: init
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          securityContext:
+            runAsUser: 0
+          command: ["/bin/sh", "/scripts/node-init.sh"]
+          env:
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: PG_BIND, value: "$(POD_NAME).fastpki-node" }
+            # ⚠️ certgen.sh falls back to `localhost` when PKI_DNS is unset, and a certificate
+            # for localhost still verifies against itself — so losing this is silent.
+            - { name: PKI_DNS, value: "$PKI_DNS" }
+            # Never defaulted: certgen refuses to write the PIN file without it.
+            - { name: FASTPKI_PIN, valueFrom: { secretKeyRef: { name: fastpki-secret, key: fastpkiPin } } }
+            - { name: PG_TLS_SANS, value: "$PG_TLS_SANS" }
+            - { name: P11_TLS, value: "$P11_TLS" }
+            - { name: P11_KIT_SERVER_ADDRESS, value: "$P11_KIT_SERVER_ADDRESS" }
+            - { name: PKCS11_MODULE, value: "$PKCS11_MODULE" }
+            - { name: PKCS11_TOKEN, value: "$PKCS11_TOKEN" }
+          volumeMounts:
+            - { name: pki, mountPath: /var/pki }
+            - { name: p11-socket, mountPath: /run/p11 }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+            - { name: pg-anchors, mountPath: /etc/fastpki/pg-anchors, readOnly: true }
+      containers:
+        - name: postgres
+          image: "$PG_IMAGE"
+          command: ["/bin/sh", "/scripts/start-postgres.sh"]
+          env:
+            - { name: POSTGRES_USER, value: "$PG_USER" }
+            - { name: POSTGRES_DB, value: "$PG_DB" }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: fastpki-secret, key: pgPassword } } }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: PG_BIND, value: "$(POD_NAME).fastpki-node" }
+            - { name: NODE_COUNT, value: "$NODE_COUNT" }
+            - { name: NODE_SERVICE, value: "fastpki-node" }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "$PG_USER", "-d", "$PG_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - { name: pgdata, mountPath: /var/lib/postgresql/data }
+            # Read-write: this container writes /pki/standby_of, and copies the certificate
+            # pair out of /pki/tls/pg into a directory it owns before serving it.
+            - { name: pki, mountPath: /pki }
+            - { name: schema, mountPath: /docker-entrypoint-initdb.d, readOnly: true }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+            - { name: pg-anchors, mountPath: /etc/fastpki/pg-anchors, readOnly: true }
+        # ⚠️ --config ON EVERY BINARY, or it reads the compiled-in default path, never the mounted
+        # file, and dials libpq's local socket in a pod where no such socket exists.
+        #
+        # ⚠️ web DEFINES THE SHARED env AND volumeMounts ANCHORS, so it has to come first and must
+        # never sit inside an `@if` section: an alias whose anchor was removed with an optional
+        # container is a YAML error for every container after it.
+        - name: web
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-web", "--config", "/app/config/bootstrap.conf"]
+          env: &fastpki-env
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            # This server's own name. The token-transport rows, the Replication page report
+            # and `key sync`'s per-host lock are all keyed by it, falling back to PKI_DNS —
+            # which every server of the deployment shares.
+            - { name: PG_BIND, value: "$(POD_NAME).fastpki-node" }
+            - { name: PKI_DNS, value: "$PKI_DNS" }
+            - { name: P11_TLS, value: "$P11_TLS" }
+            # libpq applies PGPASSWORD when the conninfo omits `password=`, which is how the
+            # database password reaches every process without passing through the ConfigMap.
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: fastpki-secret, key: pgPassword } } }
+            - { name: P11_KIT_SERVER_ADDRESS, value: "$P11_KIT_SERVER_ADDRESS" }
+            - { name: PKCS11_MODULE, value: "$PKCS11_MODULE" }
+            - { name: PKCS11_PIN_FILE, value: "$PKCS11_PIN_FILE" }
+            - { name: PKCS11_TOKEN, value: "$PKCS11_TOKEN" }
+            # Every listener is in this pod, so the console's endpoint health probe dials
+            # localhost — as a native host does — rather than a Service name per protocol.
+            - { name: HEALTH_PROBE_HOST, value: "127.0.0.1" }
+          ports:
+            - { containerPort: $WEB_PORT }
+          readinessProbe:
+            tcpSocket:
+              port: $WEB_PORT
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts: &fastpki-mounts
+            - { name: config, mountPath: /app/config/bootstrap.conf, subPath: bootstrap.conf }
+            - { name: pki, mountPath: /var/pki }
+            - { name: p11-socket, mountPath: /run/p11 }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+            - { name: pg-anchors, mountPath: /etc/fastpki/pg-anchors, readOnly: true }
+        # @if P11_TLS
+        - name: p11-tls
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/p11-tls.sh"]
+          env: *fastpki-env
+          ports:
+            - { name: p11-tls, containerPort: 12345 }
+          readinessProbe:
+            tcpSocket:
+              port: 12345
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts: *fastpki-mounts
+        # @end
+        - name: ocsp
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-ocsp", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8080 }
+          volumeMounts: *fastpki-mounts
+        - name: est
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-est", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8443 }
+          volumeMounts: *fastpki-mounts
+        - name: acme
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-acme", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8444 }
+          volumeMounts: *fastpki-mounts
+        - name: cmp
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-cmp", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8445 }
+          volumeMounts: *fastpki-mounts
+        - name: ms
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-ms", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8446 }
+          volumeMounts: *fastpki-mounts
+        - name: store
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-store", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8447 }
+          volumeMounts: *fastpki-mounts
+        - name: scep
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-scep", "--config", "/app/config/bootstrap.conf"]
+          env: *fastpki-env
+          ports:
+            - { containerPort: 8448 }
+          volumeMounts: *fastpki-mounts
+        # Compose's certrenew service: renewal, the token-transport pair, key sync from the other server,
+        # and the Postgres trust bundle. See renew-loop.sh.
+        - name: renew
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "/bin/sh", "/scripts/renew-loop.sh"]
+          env: *fastpki-env
+          volumeMounts: *fastpki-mounts
+        # @if AUDITFWD
+        # ⚠️ ONE PER SERVER, NOT A REPLICA SET. The shipper's position is one row per destination
+        # in this server's database, and two shippers reading from one mark send every row twice.
+        - name: auditfwd
+          image: "$IMAGE"
+          imagePullPolicy: "$IMAGE_PULL_POLICY"
+          command: ["/bin/sh", "/scripts/node-run.sh", "fastpki-audit", "--config", "/app/config/bootstrap.conf", "forward", "--follow"]
+          env: *fastpki-env
+          volumeMounts: *fastpki-mounts
+        # @end
+      volumes:
+        - name: p11-socket
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: fastpki-bootstrap
+        - name: scripts
+          configMap:
+            name: fastpki-bootstrap
+            defaultMode: 0755
+        - name: schema
+          configMap:
+            name: fastpki-bootstrap
+            # Run in name order by the primary's initdb only: the schema, then this data center's
+            # row, which every issuing process refuses to start without.
+            items: [{ key: createdb.sql, path: 10-fastpki.sql }, { key: datacenter.sql, path: 20-datacenter.sql }]
+        # Every server's database anchor, published by apply.sh. Mounted as a directory, not with
+        # subPath, so an update reaches a running pod — which is how a standby that has never
+        # reached any database learns to verify the one it seeds from.
+        - name: pg-anchors
+          configMap:
+            name: fastpki-pg-anchors
+            optional: true
+  # Node-local storage is RIGHT for all three now. Each claim belongs to one server, and losing
+  # a node loses that server's copy — the other server has its own token with the keys
+  # replicated into it, and its own database streaming the same history.
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "$PG_DATA_SIZE"
+        $STORAGE_CLASS_BLOCK
+    - metadata:
+        name: pki
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "$PKI_DATA_SIZE"
+        $STORAGE_CLASS_BLOCK
+    # @if SOFTHSM
+    - metadata:
+        name: softhsm-tokens
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "$SOFTHSM_TOKEN_SIZE"
+        $STORAGE_CLASS_BLOCK
+    # @end

@@ -1,0 +1,58 @@
+# Build artifacts (host-side build dir)
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+Testing/
+CTestTestfile.cmake
+install_manifest.txt
+*.o
+*.a
+*.dylib
+
+# Binaries (compiled locally, rebuilt inside Docker)
+fastpki-*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Git
+.git/
+
+# Docker (avoid recursive copy)
+Dockerfile
+docker-compose*.yml
+
+# Test/temp files
+tests/CMakeFiles/
+tests/Makefile
+tests/CTestTestfile.cmake
+tests/cmake_install.cmake
+bootstrap.conf
+*.pem
+*.key
+*.crt
+*.der
+*.p12
+*.pfx
+*.csr
+*.jks
+*.log
+!sql/*.sql
+!config/bootstrap.conf.example
+
+# Deployment answers and secrets — the token PIN and the database password live here.
+# ⚠️ NOT A CONVENIENCE: the build stage does `COPY . .`, so anything not excluded lands in
+# that layer and in the exported buildx cache, even though the runtime image copies only
+# named artifacts out of it. A secret in a cached layer is a secret published to everything
+# that can read the cache.
+deploy/.env
+**/.env

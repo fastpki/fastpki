@@ -1,0 +1,42 @@
+# Where each licence text under this directory came from.
+# Written by deploy/licences/collect-alpine.sh from aports 3.24-stable. Do not edit by hand
+# except to fill a NONE, and say so on that line.
+
+alpine-base  3.24.2  by hand, see alpine-base/NOTE
+alpine-baselayout  3.7.2  by hand, see alpine-baselayout/NOTE
+alpine-keys  2.6  by hand, see alpine-keys/NOTE
+apk-tools  3.0.8  files: LICENSE  from: https://gitlab.alpinelinux.org/alpine/apk-tools/-/archive/v3.0.8/apk-tools-v3.0.8.tar.gz
+busybox  1.37.0  files: LICENSE  from: https://busybox.net/downloads/busybox-1.37.0.tar.bz2
+ca-certificates  20260909  by hand, see ca-certificates/NOTE
+cyrus-sasl  2.1.28  files: COPYING  from: https://github.com/cyrusimap/cyrus-sasl/releases/download/cyrus-sasl-2.1.28/cyrus-sasl-2.1.28.tar.gz
+e2fsprogs  1.47.4  files: NOTICE  from: https://github.com/tytso/e2fsprogs/archive/v1.47.4.tar.gz
+eudev  3.2.14  files: COPYING  from: https://github.com/eudev-project/eudev/releases/download/v3.2.14/eudev-3.2.14.tar.gz
+gcc  15.2.0  files: COPYING COPYING.LIB COPYING.RUNTIME COPYING3 COPYING3.LIB  from: https://gcc.gnu.org/pub/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz
+gdbm  1.26  files: COPYING  from: https://ftp.gnu.org/gnu/gdbm/gdbm-1.26.tar.gz
+keyutils  1.6.3  files: LICENCE.GPL LICENCE.LGPL  from: https://git.kernel.org/pub/scm/linux/kernel/git/dhowells/keyutils.git/snapshot/keyutils-1.6.3.tar.gz
+krb5  1.22.2  files: NOTICE  from: https://web.mit.edu/kerberos/dist/krb5/1.22/krb5-1.22.2.tar.gz
+krb5-conf  1.0  by hand, see krb5-conf/NOTE
+libffi  3.5.2  files: LICENSE LICENSE-BUILDTOOLS  from: https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz
+libtasn1  4.21.0  files: COPYING COPYING.LESSERv2  from: https://ftp.gnu.org/gnu/libtasn1/libtasn1-4.21.0.tar.gz
+libtool  2.6.0  files: COPYING  from: https://alpha.gnu.org/gnu/libtool/libtool-2.6.0.tar.gz
+libverto  0.3.2  files: COPYING  from: https://github.com/latchset/libverto/archive/0.3.2.tar.gz
+libxml2  2.13.9  files: Copyright  from: https://download.gnome.org/sources/libxml2/2.13/libxml2-2.13.9.tar.xz
+libxslt  1.1.43  files: Copyright  from: https://download.gnome.org/sources/libxslt/1.1/libxslt-1.1.43.tar.xz
+lz4  1.10.0  files: LICENSE  from: https://github.com/lz4/lz4/archive/v1.10.0.tar.gz
+musl  1.2.6  files: COPYRIGHT  from: https://musl.libc.org/releases/musl-1.2.6.tar.gz
+ncurses  6.6_p20260516  files: COPYING  from: https://distfiles.alpinelinux.org/distfiles/v3.24/ncurses-6.6-20260516.tgz
+openldap  2.6.14  files: COPYRIGHT LICENSE  from: https://www.openldap.org/software/download/OpenLDAP/openldap-release/openldap-2.6.14.tgz
+opensc  0.26.1  files: COPYING  from: https://github.com/OpenSC/OpenSC/archive/refs/tags/0.26.1.tar.gz
+openssl  3.5.8  files: LICENSE.txt  from: https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
+p11-kit  0.26.2  files: COPYING  from: https://github.com/p11-glue/p11-kit/releases/download/0.26.2/p11-kit-0.26.2.tar.xz
+pax-utils  1.3.9  files: COPYING  from: https://dev.gentoo.org/~sam/distfiles/app-misc/pax-utils/pax-utils-1.3.9.tar.xz
+pcsc-lite  2.4.0  files: COPYING  from: https://distfiles.alpinelinux.org/distfiles/v3.24/pcsc-lite-2.4.0.tar.xz
+postgresql-common  1.3  by hand, see postgresql-common/NOTE
+postgresql17  17.11  files: COPYRIGHT  from: https://ftp.postgresql.org/pub/source/v17.11/postgresql-17.11.tar.bz2
+postgresql18  18.6  files: COPYRIGHT  from: https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.bz2
+readline  8.3.3  files: COPYING  from: https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz https://ftp.gnu.org/gnu/readline/readline-8.3-patches/readline83-001 https://ftp.gnu.org/gnu/readline/readline-8.3-patches/readline83-002 https://ftp.gnu.org/gnu/readline/readline-8.3-patches/readline83-003
+stunnel  5.76  files: COPYING.md COPYRIGHT.md  from: https://www.stunnel.org/archive/5.x/stunnel-5.76.tar.gz
+xmlsec  1.3.11  files: COPYING Copyright  from: https://github.com/lsh123/xmlsec/releases/download/1.3.11/xmlsec1-1.3.11.tar.gz
+xz  5.8.4  files: COPYING COPYING.0BSD COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1  from: https://github.com/tukaani-project/xz/archive/refs/tags/v5.8.4/xz-5.8.4.tar.gz
+zlib  1.3.2  files: LICENSE  from: https://zlib.net/fossils/zlib-1.3.2.tar.gz
+zstd  1.5.7  files: COPYING LICENSE  from: https://github.com/facebook/zstd/archive/v1.5.7.tar.gz

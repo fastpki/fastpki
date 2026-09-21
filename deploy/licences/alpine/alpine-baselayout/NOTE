@@ -1,0 +1,11 @@
+alpine-baselayout — installed as: alpine-baselayout, alpine-baselayout-data
+Licence declared by Alpine: GPL-2.0-only
+
+The base directory layout and the default files under /etc. /etc/protocols and /etc/services come from Debian's netbase, which is also under the GPL, version 2.
+
+Written by the Alpine Linux project. It has no upstream source: its source is the aport
+itself, https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/alpine-baselayout, which contains no licence file and no copyright notice. Alpine declares
+GPL-2.0-only for it, and no copyright notice has been published for it, so none is reproduced here.
+
+The GPL, version 2, is a standard text and needs no copyright notice of its own to state it,
+so it is reproduced alongside as GPL-2.0-only.txt, from SPDX's licence list.

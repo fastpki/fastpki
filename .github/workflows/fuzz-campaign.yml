@@ -1,0 +1,170 @@
+# The fuzzing campaign: a long run over a PERSISTENT corpus, at the two points where it is
+# worth paying for.
+#
+# ⚠️ THIS FILE WAS CALLED "nightly" AND NEVER RAN NIGHTLY. It carried no `schedule:`
+# trigger at all — only `workflow_dispatch` — underneath a header explaining which branch
+# a schedule has to live on and warning that a failure would "arrive at 03:00 with nobody
+# watching". Nothing was scheduled and nothing arrived. A name describing a cadence the
+# file does not have is worse than no name at all: it answers "is our fuzzing automated?"
+# with a yes that nothing backs, which is the same class of quiet lie as a green run that
+# fuzzed nothing.
+#
+# WHEN IT RUNS. On a release candidate, and on a release. Deliberately NOT on `main`:
+# a campaign is five harnesses at fifteen minutes each before the image build is counted,
+# and `main` moves far too often to pay that on every push — the same reasoning that keeps
+# `main` out of ci.yml's triggers. The tree that must have been fuzzed is the one about to
+# be published, and that tree is a candidate or a release.
+#
+# ⚠️ ONE FILE, TWO REPOSITORIES. The public release is a snapshot export of this tree, so
+# this workflow travels with it. Candidates are cut in the private repository and releases
+# are published from the public one, so both triggers are listed here — the file then
+# behaves correctly wherever it lands, instead of needing an edit on the way out that
+# whoever runs the export would have to remember.
+#
+# This is NOT the gate. `tests/fuzz_lane.sh` already runs inside `run_all.sh` as a
+# 30-second-per-target liveness check that a parser still rejects garbage cleanly.
+# That gate re-seeds an identical corpus every run, which is exactly right for a
+# gate — a pass means the same thing on every machine — and exactly wrong for
+# finding anything, because a coverage-guided fuzzer starting from the same seeds
+# every time re-derives the same shallow inputs and never gets deeper than its
+# first run.
+#
+# What makes a campaign worth more than the gate is the CORPUS, not the clock.
+# A persistent corpus is the whole requirement here — a job that runs rarely but
+# keeps one. So the cache below is the point of this file; the longer
+# -max_total_time is secondary.
+#
+# The same script drives both modes (FUZZ_CORPUS_DIR switches it), deliberately:
+# a separate campaign-only script would drift from the gate and rot unnoticed,
+# which is the failure mode that left fuzz/*.cpp sitting uncompiled for months.
+name: Fuzz campaign
+
+on:
+  # The candidate (this repository) and the release (the public one). Mirrors the
+  # branch pattern ci.yml already uses, including the bare name: a trigger reading
+  # `release-candidate` alone once matched nothing, because the branch actually cut
+  # was `release-candidate-0.1.0`.
+  push:
+    branches: ['release-candidate', 'release-candidate-*']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Seconds per fuzz target'
+        required: false
+        default: '900'
+
+# A campaign that overlaps itself would have two writers on one corpus.
+concurrency:
+  group: fuzz-campaign
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    # Set FASTPKI_LAB_RUNNERS=true (the private repository) to take the lab's fuzz node;
+    # unset (the public one) takes a free GitHub-hosted runner. ci.yml's header has the why.
+    runs-on: ${{ vars.FASTPKI_LAB_RUNNERS == 'true' && fromJSON('["self-hosted","lab-fuzz"]') || 'ubuntu-latest' }}
+    # ⚠️ SCALES WITH THE NUMBER OF HARNESSES, AND THAT NUMBER GREW. This said "two targets
+    # x 15 min" and allowed 90 minutes. There are five harnesses now (the lane discovers
+    # them from fuzz/), so the campaign alone is 5 x 15 = 75 minutes before the image build
+    # is counted — and a campaign killed mid-run loses the corpus it just grew, which is the
+    # one thing this workflow exists to keep. Sized for the current set with room for the
+    # build; revisit when a sixth harness lands, or lower `seconds`.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build in the project's Alpine image: it carries OpenSSL 3.5 (the runner
+      # ships 3.0) and `clang compiler-rt`, which is what supplies libFuzzer's
+      # runtime on musl. `tests/fuzz_lane.sh` self-skips without it, so a missing
+      # runtime would turn this job green while fuzzing nothing — the assertion
+      # after the run exists to catch exactly that.
+      - name: Build image
+        run: docker build --target build -t fastpki-build .
+
+      # THE POINT OF THIS WORKFLOW. restore-keys makes every run start from the
+      # most recent corpus; the run-number in `key` makes each run save a new
+      # entry rather than colliding with an immutable one (GitHub caches cannot
+      # be overwritten, so a fixed key would freeze the corpus at day one — the
+      # exact "campaign that carries nothing over" this is meant to avoid).
+      # ⚠️ THE CORPUS LIVES OUTSIDE THE WORKSPACE, and on a self-hosted runner that is not a
+      # preference — it is the difference between carrying the corpus forward and losing it
+      # every run. actions/checkout runs `git clean -ffdx`, so an untracked `fuzz-corpus` in
+      # the workspace would be DELETED before each campaign, and the one thing this workflow
+      # exists to accumulate would reset to empty every time.
+      #
+      # actions/cache is gone with it: it existed to carry the corpus across the destruction
+      # of a hosted VM. This runner keeps its disk, so the corpus simply persists, grows
+      # across campaigns, and needs no upload.
+      - name: Fuzz
+        run: |
+          CORPUS="$HOME/.cache/fastpki/fuzz-corpus"
+          mkdir -p "$CORPUS"
+          echo "corpus: $CORPUS ($(find "$CORPUS" -type f 2>/dev/null | wc -l) inputs carried forward)"
+          docker run --rm \
+            -v "$CORPUS:/corpus" \
+            -e FUZZ_CORPUS_DIR=/corpus \
+            -e FUZZ_SECONDS='${{ github.event.inputs.seconds || 900 }}' \
+            -e OSSL=openssl -e OPENSSL_ROOT=/usr \
+            fastpki-build \
+            bash tests/fuzz_lane.sh 2>&1 | tee fuzz.log
+
+      # A skip must not pass for a run. If clang or the libFuzzer runtime went
+      # missing from the image, the script exits 0 with a SKIP line and the step
+      # above stays green while nothing was fuzzed.
+      - name: Assert the campaign actually ran
+        run: |
+          if grep -q '\[SKIP\]' fuzz.log; then
+            echo "::error::the fuzz lane skipped — nothing was fuzzed"
+            sed -n 's/^ *\[SKIP\]/  reason:/p' fuzz.log
+            exit 1
+          fi
+          # The lane's own execution floor is the real assertion — it fails the run
+          # when a harness stops early, which is how a 900-second campaign once reported
+          # clean after 4 executions. Require EVERY harness to have reported.
+          #
+          # ⚠️ THE EXPECTED COUNT IS READ FROM THE RUN, NOT HARDCODED. This asserted
+          # `-ge 3` against a fixed three. Two harnesses were later added, and the check
+          # would have passed with any three of the five reporting — silently tolerating
+          # two that had stopped running, which is the same "the list does not grow" bug
+          # the lane itself had. The lane prints the set it discovered; compare against it.
+          want=$(sed -n 's/^ *harnesses: *//p' fuzz.log | tr ' ' '\n' | grep -c . || true)
+          n=$(grep -c 'survives' fuzz.log || true)
+          [ "$want" -gt 0 ] || { echo "::error::the lane reported no harness list"; exit 1; }
+          [ "$n" -eq "$want" ] || {
+            echo "::error::only $n of $want harnesses ran"
+            exit 1
+          }
+          grep -E 'survives|COVERS|RAN the inputs|PASS=' fuzz.log
+
+      # ⚠️ STAGED INTO THE WORKSPACE FIRST. The corpus now lives under $HOME (see the Fuzz
+      # step), and upload-artifact resolves `path:` against the workspace — it cannot see
+      # $HOME, and the variable would not expand there anyway. Copied rather than moved, so
+      # the corpus keeps the input that found the bug.
+      - name: Stage crash reproducers
+        if: failure()
+        run: |
+          mkdir -p fuzz-crashes
+          cp -a "$HOME/.cache/fastpki/fuzz-corpus/crashes/." fuzz-crashes/ 2>/dev/null || true
+          echo "staged $(find fuzz-crashes -type f | wc -l) reproducer(s)"
+
+      # A find is only useful if the input that caused it survives the runner.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            fuzz-crashes/
+            fuzz.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # The node persists and this job builds an image every run; nothing reclaims it
+      # otherwise. Dangling only — this DC runs the deployment too, and `prune -a` would
+      # take images its stopped containers still need.
+      - name: Reclaim disk
+        if: always()
+        run: |
+          docker image prune -f
+          df -h / | tail -1

@@ -1,0 +1,185 @@
+# fastpki configuration. Same key set is also accepted via environment.
+# Copy to bootstrap.conf and edit.
+#
+# Any non-bootstrap key below can instead live in the database `config` table
+# Servers overlay it on this file at startup (the DB wins).
+# Manage it with `fastpki-config` or the web console's Config tab. Only the
+# bootstrap key PG_CONNINFO must stay in this file.
+
+PKI_DNS=localhost
+
+# Public base URL the ACME directory advertises its endpoints under. Set this in
+# production to the externally reachable URL (e.g. behind a TLS proxy):
+#   BASE_URL=https://pki.example.org
+# If left unset, the ACME server derives it per-request from the Host header (and
+# X-Forwarded-Proto), so it works on whatever address/port it's reached on.
+# BASE_URL=https://pki.example.org
+
+# CA material is NOT configured here. A CA is a row in the `certs` table (is_ca=true)
+# Create one from the web console, and every protocol addresses it by
+# its id (/.well-known/est/{ca_id}/…, /cmp/{ca_id}, …). A fresh deployment starts
+# with no CA at all and the enrolment services stay down until you make one.
+
+# PKCS#11 HSM / smart card for CA signing keys. A CA's private key is a
+# "pkcs11:" URI stored on its `certs` row, so the key is used from the token and
+# never leaves the hardware (Thales/YubiHSM/Nitrokey/SoftHSM). PKCS11_MODULE is the
+# vendor's PKCS#11 .so; PKCS11_PROVIDER_PATH is the dir holding OpenSSL's pkcs11.so
+# provider (omit to use OpenSSL's default).
+# ⚠️ ACTIVE, NOT COMMENTED OUT, AND THAT MATTERS BECAUSE THIS FILE IS THE LIVE CONFIG.
+# The image bakes this file in as /app/config/bootstrap.conf, so whatever it says is what a
+# deployment that does not mount its own config actually runs. With the block below
+# commented out, such a deployment had no token configured at all while the compose stack
+# beside it put every key in one — two shipped configs describing two different products.
+# A private key belongs in the token; files are the last resort, not the default.
+#
+# PKCS11_MODULE is the p11-kit client shim, which talks to the SoftHSM container over a unix
+# socket. Point it at a vendor .so to use a real HSM instead; nothing else changes.
+PKCS11_MODULE=/usr/lib/pkcs11/p11-kit-client.so
+# PKCS11_PROVIDER_PATH=/usr/lib/ossl-modules   # omit to use OpenSSL's default dir
+PKCS11_PIN_FILE=/var/pki/tls/pin
+
+# Database. PostgreSQL is the only backend.
+# PG_CONNINFO=host=pg port=5432 dbname=postgres user=postgres password=... sslmode=require
+
+# Multi-data-center active-active replication. When this
+# node is in a mesh, every serial it mints carries a 2-octet prefix that is its own, so
+# the certs primary key never collides across data centers. Leave unset for single-node
+# (full-width random serials).
+#
+# The prefix itself is NOT configured here — the node reads it from its own row in the
+# `datacenters` table, so the bound has one source of truth. Generate that map plus the
+# publication, the guard trigger and the origin=none subscriptions with `fastpki-mesh`.
+# ⚠️ An id set here with no matching row means this node REFUSES to issue.
+# ⚠️ DIGITS, matching the `dc_id` in the topology EXACTLY. The lookup is
+# `SELECT serial_prefix FROM datacenters WHERE dc_id=$1` against this literal value, and
+# every installer writes the bare index, so `dc1` parses fine and matches nothing — the
+# node then refuses to start with "has no row in `datacenters`".
+# ⚠️ AN HA PAIR SHARES ONE ID. A pair is one data center twice, so a standby carries the
+# SAME value as its primary, not a new one. See docs/high-availability.md.
+# DATACENTER_ID=1
+
+# Web console. HTTPS, with the listener key in the token and the certificate as a DB row
+# — the same arrangement as every other listener. Serving the console over plain HTTP is
+# not a smaller version of this: the Web Crypto request form needs a secure context to run
+# at all, and the session cookie only carries `Secure` when TLS is configured, so a plain
+# deployment hands the session token to any same-host plaintext request.
+WEB_TLS_KEY=pkcs11:token=fastpki;object=web-tls;type=private?pin-source=/var/pki/tls/pin
+WEB_CERT_ID=web
+# Bind address, port and the WEB_ALLOW_REVOKE write switch are NOT set here: their
+# compiled defaults are already what a deployment needs — 0.0.0.0 like every other
+# listener, and writes enabled — so a line here would only restate one.
+
+# OCSP responder (also serves the CRL at CRL_PATH)
+# Delegated OCSP responder (RFC 6960): sign responses with a dedicated
+# cert+key instead of the CA key, so the CA key can stay offline / HSM.
+# The cert must be issued by the signing CA with the id-kp-OCSPSigning EKU.
+# OCSP_RESPONDER_CERT=/etc/ssl/ocsp-responder.pem
+# OCSP_RESPONDER_KEY=/etc/ssl/private/ocsp-responder.key   # PEM path or pkcs11: URI
+# Background sweep that marks expired certs (seconds); off the request path.
+# CRL cache TTL (seconds): regenerate the CRL at most this often (0 disables).
+# The CRL also carries crlNumber + authorityKeyIdentifier (RFC 5280).
+
+# EST responder
+# The listener key is minted INSIDE the token on first start and the certificate is a DB
+# row, self-signed until a CA exists and replaced automatically once one issues for this
+# id. EST_CERT is deliberately absent: a certificate file on disk would win over the row
+# and freeze the listener on whatever was written there.
+EST_KEY=pkcs11:token=fastpki;object=est-tls;type=private?pin-source=/var/pki/tls/pin
+EST_CERT_ID=est
+
+# Issuance policy
+# Minimum key sizes (bits) — requests below these are rejected. The SAN COUNT limit is
+# NOT here: it is `roles.max_san`, set per role from the console.
+# Approved-domain allowlist: CN + DNS SANs must match a suffix in the
+# `allowed_domains` TABLE — manage it with `fastpki-config
+# domains-add/domains-import` or the console. The table ships EMPTY and an empty
+# list allows any name, so a new deployment is open by name and confined by auth,
+# the profile and key sizes. Add domains to restrict it to names you own.
+# ECMAScript regex an IP SAN must match (default: 10.0.0.0/8 only).
+ALLOWED_IPS_REGEX=^10\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$
+CRL_DPS=http://pki.example.org/pki/signing_ca.crl
+AIA_CA_ISSUERS=http://pki.example.org/pki/signing_ca.crt
+AIA_OCSP=http://pki.example.org/ocsp/
+
+# Auth backend for EST / MS-WSTEP password auth: local | ldap
+#   local — users in the `web_users` TABLE, the only user store.
+#           Manage with `fastpki-config web-user <name> <pw> [--role R]`.
+#   ldap  — bind against the directories configured on the console's Directories page
+#           (needs build flag FASTPKI_WITH_LDAP, which is ON by default). The
+#           DIRECTORIES themselves are rows, not keys — see below.
+#
+# ⚠️ Those two are the whole set, and no setting anywhere turns authentication off.
+AUTH_BACKEND=local
+
+# ACME (HTTPS-only — terminates its own TLS, like EST)
+ACME_KEY=pkcs11:token=fastpki;object=acme-tls;type=private?pin-source=/var/pki/tls/pin
+ACME_CERT_ID=acme
+# DNS resolver for DNS-01 challenge validation ("host" or "host:port"; port
+# defaults to 53). Empty = first nameserver in /etc/resolv.conf.
+# ACME_DNS_RESOLVER=
+# Background sweep of expired ACME nonces + orders (seconds; 0 disables).
+
+# CMP
+# Authentication (fail closed, and there is no switch). Supply a per-user PBM
+# secret in `keys` and/or a client-cert trust anchor; with neither, the server rejects
+# every request.
+# CMP PBM is PER USER: each console user gets a secret minted into `keys` and
+# sends it with -ref <username> -secret pass:<their secret>. There is no global key.
+# CMP_CLIENT_CA=/etc/ssl/client_ca.pem  # trust anchor for client-cert-signed requests
+# RA mode: protect CMP responses with an RA cert+key instead of the CA
+# key, so the CA key can stay offline / HSM. The RA cert must be issued by
+# the signing CA; clients verify the protection by chaining RA -> CA.
+# CMP_RA_CERT=/etc/ssl/cmp-ra.pem
+# CMP_RA_KEY=/etc/ssl/private/cmp-ra.key   # PEM path or pkcs11: URI
+# Per-user PBM secrets: add rows to the `keys` table (kid = the client's
+# senderKID / `openssl cmp -ref` value, key = that user's raw secret). Matching
+# requests validate against the per-user secret; others fall back to the global.
+# Revocation authorization (fail-closed only): `rr` must be signature-protected
+# (PBM is for enrollment); a caller may revoke only certs it owns unless one of its
+# roles grants `cert:revoke:all` (MASTER_USERS is gone — no globals).
+
+# MS-XCEP / MS-WSTEP (one listener, two paths). HTTPS-only — Windows enrollment
+# clients (certreq/certlm.msc) require TLS; certreq rejects http:// policy servers.
+MS_KEY=pkcs11:token=fastpki;object=ms-tls;type=private?pin-source=/var/pki/tls/pin
+MS_CERT_ID=ms
+# MS_XCEP_GUID is deliberately NOT set here. fastpki-ms mints one per node on
+# first start and stores it in the node-local `config` table, so each DC gets its own.
+# Shipping a value here would put every deployment back on one shared policy id.
+# Kerberos/SPNEGO single sign-on for MS-WSTEP. With a service keytab
+# the server offers `WWW-Authenticate: Negotiate` (and Basic) so domain-joined
+# Windows clients enroll passwordlessly with their Kerberos ticket; it falls
+# back to Basic / WS-Security UsernameToken otherwise. Requires a build with
+# -DFASTPKI_WITH_KERBEROS=ON (the Docker image enables it).
+
+# SCEP (RFC 8894). ⚠️ SET SCEP_RA_KEY, OR SCEP WORKS ONLY WHILE THE CA IS RSA. Without it
+# the server falls back to the CA's own key — and an SCEP RA key must DECRYPT the
+# PKIOperation envelope, which needs RSA key transport. On an EC CA (the default the console
+# offers) every enrolment is then refused, and nothing in the configuration says why. The
+# size is settable; the algorithm is not, because RFC 8894 fixes it.
+# SCEP_RA_KEY=pkcs11:token=fastpki;object=scep-ra;type=private?pin-source=/var/pki/tls/pin
+# SCEP_RA_KEY_BITS=3072
+
+# RFC 4387 cert/CRL store
+
+# --- Directories (LDAP/AD), SAML, OIDC and Kerberos -------------------------------------
+# NOT configured here, and there is no key to uncomment. A directory is a ROW, so one
+# deployment can authenticate against several AD domains at once, each with its own URIs,
+# base DNs and service account. SAML and OIDC providers are rows beside it, and Kerberos is
+# a keytab uploaded onto a directory rather than a provider of its own.
+#
+#   console  -> Directories
+#   CLI      -> fastpki-config auth-providers-add|list|remove   (LDAP/AD only)
+#   guide    -> docs/admin-guide.md 7, docs/authentication.md 8
+#
+# AUTH_BACKEND above belongs here: it chooses the BACKEND, which is not a directory.
+
+# Software update feed. By default `fastpki-update check` and the
+# console's Updates panel poll the creatica-soft/FastPKI GitHub releases. Point
+# UPDATE_FEED_URL at a self-hosted JSON manifest ({"version","url","notes"}) for
+# air-gapped / enterprise deployments. RELEASE_PUBKEY pins the PEM public key the
+# release artifacts are signed with — `fastpki-update verify` refuses anything else.
+# UPDATE_FEED_URL=https://updates.example.org/fastpki/latest.json
+# RELEASE_PUBKEY=/etc/fastpki/release.pub.pem
+
+# err | info | debug
+LOG_LEVEL=info

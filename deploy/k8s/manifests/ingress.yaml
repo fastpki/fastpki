@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fastpki-web
+  labels:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: web
+spec:
+  $INGRESS_CLASS_BLOCK
+  $INGRESS_TLS_BLOCK
+  rules:
+    - host: "$INGRESS_HOST"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: fastpki-web
+                port:
+                  number: $WEB_PORT

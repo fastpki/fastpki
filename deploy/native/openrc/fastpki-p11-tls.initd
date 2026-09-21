@@ -1,0 +1,279 @@
+#!/sbin/openrc-run
+# OpenRC service — the token over mTLS, the native equivalent of the `p11-tls` service in
+# deploy/docker-compose.yml and of fastpki-p11-tls in Kubernetes.
+#
+# fastpki-token serves the token on a unix socket, which is reachable only by processes on
+# THIS host: p11-kit speaks neither TLS nor TCP, its shipped binaries parsing `unix:path=`
+# and `vsock:cid=;port=` and linking no bind/listen. That is what pins a deployment to one
+# node. This is the SERVER half of a proxy pair that lifts it — TLS on a port, forwarded into
+# the same socket the local services already use, so nothing about them changes.
+#
+# ⚠️ IT REPLACES FILESYSTEM PERMISSION WITH CERTIFICATE IDENTITY. A bare TCP bridge in front
+# of that socket would hand use of every CA private key to whoever could reach the port. Here
+# both ends verify the peer AND the chain, and this side trusts only the certificates certgen
+# minted into ${P11_TLS_DIR}/clients. There is deliberately no setting that relaxes it.
+#
+# ⚠️ C_LOGIN CROSSES THIS LINK, carrying the PIN that protects every CA key in the token. On
+# one host that PIN is a 0400 file that never leaves the machine.
+#
+# ⚠️ NOT ENABLED BY DEFAULT. install-native.sh enables it only when P11_TLS=on, which is also
+# what makes certgen mint the keypair each end needs. A host with no material refuses to
+# start rather than serving the token unauthenticated.
+
+: "${FASTPKI_CONF_D:=/etc/conf.d/fastpki}"
+# shellcheck source=/dev/null
+[ -r "$FASTPKI_CONF_D" ] && . "$FASTPKI_CONF_D"
+: "${FASTPKI_LOGDIR:=/var/log/fastpki}"
+: "${P11_SOCKET_DIR:=/run/p11}"
+: "${P11_SOCKET:=${P11_SOCKET_DIR}/pkcs11.sock}"
+: "${FASTPKI_CONF:=/etc/fastpki/bootstrap.conf}"
+: "${P11_TLS_DIR:=/var/pki/tls/p11}"
+: "${P11_TLS_PORT:=12345}"
+: "${P11_TLS_BIND:=0.0.0.0}"
+: "${PKCS11_TOKEN:=fastpki}"
+: "${PKCS11_PIN_FILE:=/var/pki/tls/pin}"
+
+name="FastPKI token transport (mTLS)"
+description="Publishes the p11-kit token socket over mutually authenticated TLS"
+
+# ⚠️ A SHIPPED WRAPPER, which carries the environment stunnel cannot otherwise get across
+# the switch to command_user — see fastpki-p11-tls-run.sh for what was tried. It has to be
+# shipped rather than written by start_pre: OpenRC validates $command BEFORE start_pre runs.
+command="/usr/libexec/fastpki/fastpki-p11-tls-run.sh"
+command_args=""
+
+supervisor=supervise-daemon
+# ⚠️ RUN AS THE TOKEN'S OWN USER, NOT ROOT-THEN-setuid. p11-kit-server checks the peer
+# uid, which now covers loading stunnel's OWN key as well as the backend connection, and
+# stunnel's `setuid` applies only after its TLS contexts are built. Started as root it never
+# binds and first boot fails with the node serving nothing at all.
+#
+# ⚠️ THE USER ALONE, NOT "user:group". OpenRC renders the pair as `--user fastpki fastpki`
+# — a stray token the supervisor takes as the command — and the child never execs, silently.
+# Defaulted first because unset it expands to ":" and the setting is ignored entirely,
+# leaving the daemon as root; fastpki.initd defaults it the same way.
+: "${FASTPKI_USER:=fastpki}"
+command_user="${FASTPKI_USER}"
+pidfile="/run/supervise-${RC_SVCNAME}.pid"
+respawn_delay=2
+# Unbounded, like every other FastPKI service: a protocol binary whose token handle dies
+# exits(0) to be respawned with a fresh one, and that recovery only works if the thing it
+# reconnects THROUGH comes back too.
+respawn_max=0
+output_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+error_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+
+depend() {
+    need fastpki-token
+    before fastpki-ocsp fastpki-est fastpki-acme fastpki-cmp fastpki-ms fastpki-scep \
+           fastpki-store fastpki-web
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o "${FASTPKI_USER:-fastpki}:${FASTPKI_USER:-fastpki}" \
+        "$FASTPKI_LOGDIR" || return 1
+    # ⚠️ THE FILE TOO, NOT ONLY THE DIRECTORY. supervise-daemon redirects the child's
+    # stdout and stderr into this file and then drops to command_user, so a root-owned log
+    # leaves the child unable to write one byte: it dies with NOTHING anywhere — no stunnel
+    # banner, no error, an empty log and a service that merely reports it did not bind. That
+    # silence cost more time than the failure it was hiding.
+    checkpath -f -m 0640 -o "${FASTPKI_USER}:${FASTPKI_USER}" "$error_log" || return 1
+
+    # ⚠️ AND BOTH TRUST DIRECTORIES, FOR THE SAME REASON ONE STEP FURTHER OUT. start_pre
+    # runs as root whatever command_user says, so the p11-*-sync calls below create these
+    # directories owned by root — while the DAILY fastpki-certrenew job runs the same two
+    # commands as ${FASTPKI_USER} and then cannot write into them. Peer trust therefore
+    # converged once, at boot, and never again: a peer that renewed its transport
+    # certificate was locked out a day later, and a node meshed AFTER this one was never
+    # admitted at all. Both call sites hide it — the sync here is `|| ewarn`, the one in
+    # certrenew is `|| true` — so the only symptom is stunnel's `tlsv1 alert unknown ca`
+    # in the peer's log, and `key replicate` failing with CKR_DEVICE_ERROR, which names
+    # neither the directory nor the permission. Measured on a three-node mesh.
+    for _d in clients servers; do
+        checkpath -d -m 0755 -o "${FASTPKI_USER}:${FASTPKI_USER}" \
+            "${P11_TLS_DIR}/${_d}" || return 1
+    done
+
+    # Refuse rather than improvise. Every failure below leaves the token exactly as
+    # reachable as it was — on the local socket only — which is the safe direction.
+    # ⚠️ THE PRIVATE KEY IS A TOKEN OBJECT, so there is no server.key to look for. What has
+    # to exist is the certificate on disk; its private half is `p11-server` in this node's
+    # own token, and the socket check below covers that.
+    if [ ! -f "${P11_TLS_DIR}/server.crt" ]; then
+        eerror "no transport certificate in ${P11_TLS_DIR}."
+        eerror "It is minted by certgen under P11_TLS=on; re-run /usr/share/fastpki/certgen.sh with FASTPKI_PIN=\$(cat ${PKCS11_PIN_FILE}) and P11_TLS=on."
+        return 1
+    fi
+    if [ ! -d "${P11_TLS_DIR}/clients" ]; then
+        eerror "${P11_TLS_DIR}/clients does not exist, so no client could be trusted."
+        return 1
+    fi
+    # An empty trust directory would authenticate nobody and refuse everyone — a listener
+    # that cannot possibly serve. Say so at start rather than at the first connection.
+    if [ -z "$(ls -A "${P11_TLS_DIR}/clients" 2>/dev/null)" ]; then
+        eerror "${P11_TLS_DIR}/clients is empty: no client certificate is trusted."
+        return 1
+    fi
+    [ -S "$P11_SOCKET" ] || {
+        eerror "${P11_SOCKET} does not exist — fastpki-token is not serving the token."
+        return 1
+    }
+
+    # Trust set from the mesh rather than from files carried between hosts. Best-effort: a
+    # transient database outage must not take the token offline, so a failure leaves whatever
+    # is already on disk in place and says so.
+    # ⚠️ AND PUBLISH THE OTHER HALF. A peer verifies the host it dials against a
+    # certificate this node has advertised, so without this it would be pinning one it
+    # generated itself — which this node has never presented.
+    #
+    # ⚠️ UNDER PG_BIND, WHICH NAMES THIS MACHINE. Both publishes key their row on it, with
+    # PKI_DNS as the fallback, and the two hosts of a pair share PKI_DNS — so without it the
+    # second host's certificates overwrite the first's and no key can be replicated between
+    # them (the symptom is `C_Initialize failed (rc=48)`). conf.d is sourced, not exported.
+    PG_BIND="${PG_BIND:-}" fastpki-config --config "$FASTPKI_CONF" \
+        p11-server-publish "${P11_TLS_DIR}/server.crt" \
+        || ewarn "could not publish this node's server certificate; peers cannot verify this host until it succeeds"
+
+    fastpki-config --config "$FASTPKI_CONF" \
+        p11-clients-sync "${P11_TLS_DIR}/clients" \
+        || ewarn "could not refresh ${P11_TLS_DIR}/clients; using what is on disk"
+
+    # ⚠️ AND THE DIALLING HALF, AT START — NOT ONLY IN THE DAILY JOB. Every node with
+    # P11_TLS on publishes its own token AND may dial a peer to replicate a CA key out of
+    # one, so both halves of the trust belong here. When this ran only daily, a freshly
+    # installed node had an empty servers/ directory and `fastpki-ca key replicate --from`
+    # — the command docs/deployment.md tells an operator to run — refused with "no peer token
+    # host can be verified" for up to a day, with nothing to say it was a matter of waiting.
+    PG_BIND="${PG_BIND:-}" fastpki-config --config "$FASTPKI_CONF" \
+        p11-client-publish "${P11_TLS_DIR}/client.crt" \
+        || ewarn "could not publish this node's client certificate; peers cannot admit it until this succeeds"
+    fastpki-config --config "$FASTPKI_CONF" \
+        p11-servers-sync "${P11_TLS_DIR}/servers" \
+        || ewarn "could not refresh ${P11_TLS_DIR}/servers; using what is on disk"
+    openssl rehash "${P11_TLS_DIR}/servers" >/dev/null 2>&1 || true
+
+    # ⚠️ AND INDEX THE WHOLE DIRECTORY. The sync links only the dc-*.crt files it owns, and
+    # certgen indexes this directory once at install time — so a client certificate added any
+    # other way afterwards (cloud-init on a provisioned node, or an operator dropping a second
+    # node's in, which is exactly how certgen's own comment says to add one) is invisible to
+    # the CApath lookup and that node is refused. Cheap and idempotent.
+    openssl rehash "${P11_TLS_DIR}/clients" >/dev/null 2>&1 \
+        || ewarn "could not index ${P11_TLS_DIR}/clients"
+
+    # Written here rather than shipped, so the paths this service uses and the ones it
+    # advertises can never disagree. checkHost/checkIP are deliberately absent: addresses
+    # are dynamic across the deployment shapes this supports, so the identity is the pinned
+    # certificate rather than where it answers from.
+    # ⚠️ NO setuid/setgid — command_user starts the process as that user already, which is
+    # the only form that works now the key is a token object. The peer-uid check that made
+    # setuid necessary still applies to the backend socket; it is simply satisfied before
+    # stunnel ever has to open the token.
+    cat > "${P11_SOCKET_DIR}/stunnel-p11.conf" <<EOF
+foreground = yes
+pid =
+
+[p11]
+accept = ${P11_TLS_BIND}:${P11_TLS_PORT}
+connect = ${P11_SOCKET}
+cert = ${P11_TLS_DIR}/server.crt
+key = pkcs11:token=${PKCS11_TOKEN};object=p11-server;type=private?pin-source=${PKCS11_PIN_FILE}
+CApath = ${P11_TLS_DIR}/clients
+verifyPeer = yes
+verifyChain = yes
+EOF
+    chmod 0644 "${P11_SOCKET_DIR}/stunnel-p11.conf" || return 1
+
+    # ⚠️ stunnel CANNOT SEE THE pkcs11 PROVIDER WITHOUT A CONFIG SAYING SO. FastPKI's own
+    # binaries load it programmatically (ensure_pkcs11_provider, src/lib/x509.cpp); stunnel is
+    # a stock Alpine binary reading the stock /etc/ssl/openssl.cnf, which activates nothing.
+    # Written here so the paths this service uses and the ones it advertises cannot disagree.
+    #
+    # ⚠️ pkcs11-module-path IS THE CLIENT SHIM, NEVER libsofthsm2.so. Loading SoftHSM
+    # in-process re-enters libcrypto while it holds a lock; measured on the shipped image,
+    # that HANGS or fails run to run, for RSA as much as EC — a deadlock, not an algorithm
+    # limitation.
+    cat > "${P11_SOCKET_DIR}/stunnel-openssl.cnf" <<EOF
+openssl_conf = fastpki_conf
+[fastpki_conf]
+providers = fastpki_providers
+[fastpki_providers]
+default = fastpki_default
+pkcs11  = fastpki_pkcs11
+[fastpki_default]
+activate = 1
+[fastpki_pkcs11]
+module = ${OSSL_MODULES_DIR:-/usr/lib/ossl-modules}/pkcs11.so
+pkcs11-module-path = ${PKCS11_MODULE:-/usr/lib/pkcs11/p11-kit-client.so}
+activate = 1
+EOF
+    chmod 0644 "${P11_SOCKET_DIR}/stunnel-openssl.cnf" || return 1
+    # ⚠️ EXPORTED LAST, AND ONLY HERE. OpenRC runs start_pre in the shell that then execs
+    # supervise-daemon, so an export here reaches stunnel and nothing else — which is what is
+    # wanted: OPENSSL_CONF applies to every OpenSSL program that inherits it, and the
+    # fastpki-config and `openssl rehash` calls ABOVE must not run under a config that
+    # activates a pkcs11 provider they have no use for. /etc/conf.d/fastpki is not an option:
+    # it is sourced without export and shared by every FastPKI service.
+    export OPENSSL_CONF="${P11_SOCKET_DIR}/stunnel-openssl.cnf"
+    export P11_KIT_SERVER_ADDRESS="unix:path=${P11_SOCKET}"
+    return 0
+}
+
+start_post() {
+    # ⚠️ KEEP THE TRUST DIRECTORY FRESH, because everything in start_pre ran once. On a new
+    # mesh the node that started FIRST has an empty clients/ directory: its peers publish
+    # their transport certificates minutes later and nothing re-reads them, so
+    # `fastpki-ca key replicate --from <this node>` is refused in the TLS handshake and the
+    # DIALLING side reports `C_Initialize failed (rc=48)` — CKR_DEVICE_ERROR, which names
+    # the token and not the trust, sending the reader to the PIN. The daily certrenew job
+    # syncs too, but daily, and a node that is merely SERVING its token has nothing failing
+    # on it to bring that forward.
+    #
+    # CApath is looked up per handshake by hash, so a peer's FIRST certificate takes effect for
+    # the next connection with no reload. Best-effort and silent: whatever is already on disk
+    # stays valid, and a transient database outage must not take the token offline. Started
+    # before the bind-wait below, which returns as soon as the port is up.
+    #
+    # ⚠️ A REPLACED CERTIFICATE NEEDS stunnel TO RELOAD. OpenSSL's hashed-directory lookup keeps
+    # a certificate in memory once loaded, and a peer's new certificate has the same subject,
+    # so the same hash, as the one it replaces. Measured on a Kubernetes pair: a host rebuilt
+    # with a new transport keypair was refused ("certificate not found in local repository")
+    # against the cached old certificate while its new one sat in clients/, so its empty token
+    # could never be refilled. A SIGHUP makes stunnel build its TLS context again.
+    ( while sleep 60; do
+        [ -f "${pidfile}" ] || exit 0     # the service went away; do not outlive it
+        _before=$(cat "${P11_TLS_DIR}"/clients/*.crt 2>/dev/null | cksum)
+        fastpki-config --config "$FASTPKI_CONF" p11-clients-sync "${P11_TLS_DIR}/clients" >/dev/null 2>&1 \
+          && openssl rehash "${P11_TLS_DIR}/clients" >/dev/null 2>&1
+        fastpki-config --config "$FASTPKI_CONF" p11-servers-sync "${P11_TLS_DIR}/servers" >/dev/null 2>&1 \
+          && openssl rehash "${P11_TLS_DIR}/servers" >/dev/null 2>&1
+        [ "$(cat "${P11_TLS_DIR}"/clients/*.crt 2>/dev/null | cksum)" = "$_before" ] \
+          || pkill -HUP -x stunnel 2>/dev/null
+      done ) >/dev/null 2>&1 &
+    echo $! > "${P11_SOCKET_DIR}/trust-refresh.pid" 2>/dev/null || true
+
+    # OpenRC calls a supervise-daemon service started once the process is LAUNCHED, which is
+    # not the same as the port being bound — and a peer dialling in between gets a connection
+    # refused that looks like a firewall. Same explicit wait fastpki-token does for its
+    # socket, for the same reason.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        if command -v ss >/dev/null 2>&1; then
+            ss -lnt 2>/dev/null | grep -q ":${P11_TLS_PORT}" && return 0
+        else
+            netstat -lnt 2>/dev/null | grep -q ":${P11_TLS_PORT}" && return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    eerror "stunnel did not bind ${P11_TLS_BIND}:${P11_TLS_PORT} within 30s — see ${error_log}"
+    return 1
+}
+
+stop_post() {
+    if [ -f "${P11_SOCKET_DIR}/trust-refresh.pid" ]; then
+        kill "$(cat "${P11_SOCKET_DIR}/trust-refresh.pid")" 2>/dev/null || true
+        rm -f "${P11_SOCKET_DIR}/trust-refresh.pid"
+    fi
+    rm -f "${P11_SOCKET_DIR}/stunnel-p11.conf"
+    return 0
+}

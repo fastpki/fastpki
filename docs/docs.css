@@ -1,0 +1,154 @@
+/* docs.css — the published guides, in the site's own design system.
+ *
+ * Every colour, font and radius here is one of the site's tokens, so the guides follow it
+ * into dark mode and through any later change to the palette. Nothing is hard-coded: a
+ * literal colour here would be the one thing on the site that does not move with the rest.
+ *
+ * The layout is a contents sidebar and a column of text. pandoc's chunked output gives each
+ * chapter prev/next/up links and nothing else, which means a reader who wants section 9 of a
+ * fifteen-chapter guide has to walk there. The whole guide is listed on the left instead,
+ * the way it is in the PDF, so any chapter is one click from any other.
+ */
+
+.docs-body {
+  margin: 0;
+  background: var(--bg-canvas);
+  color: var(--text-body);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: 1.65;
+}
+
+/* ── the bar above everything ───────────────────────────────────────────────────────── */
+.docs-top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 20px;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.docs-brand { font-family: var(--font-display); font-weight: 600; text-decoration: none; color: var(--text-strong); }
+.docs-sep   { color: var(--text-faint); }
+.docs-crumb { text-decoration: none; color: var(--text-link); }
+.docs-crumb:hover { color: var(--text-link-hover); }
+.docs-version {
+  margin-left: auto;
+  font-family: var(--font-mono); font-size: var(--text-2xs);
+  color: var(--text-muted);
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-full, 999px);
+  padding: 2px 10px;
+}
+/* Shown only where the sidebar folds away. */
+.docs-menu { display: none; }
+
+/* ── sidebar + text ─────────────────────────────────────────────────────────────────── */
+.docs-shell {
+  display: grid;
+  grid-template-columns: 290px minmax(0, 1fr);
+  gap: 40px;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+.docs-side {
+  position: sticky; top: 57px;
+  align-self: start;
+  max-height: calc(100vh - 57px);
+  overflow-y: auto;
+  padding: 28px 0 60px;
+}
+.docs-main {
+  min-width: 0;            /* or a wide code block stretches the grid and breaks the layout */
+  padding: 28px 0 96px;
+}
+
+/* ── the contents ───────────────────────────────────────────────────────────────────── */
+.docs-toc ol { list-style: none; margin: 0; padding: 0; }
+.docs-toc li { margin: 0; }
+.docs-toc a {
+  display: block;
+  padding: 6px 12px;
+  border-left: 2px solid transparent;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: var(--text-sm, 0.93rem);
+  line-height: 1.45;
+}
+.docs-toc a:hover { color: var(--text-strong); background: var(--bg-base); }
+/* Where the reader is. Without it a long contents gives no sense of place at all. */
+.docs-toc li.here > a {
+  color: var(--text-link);
+  border-left-color: var(--accent-solid, var(--brand-500));
+  background: var(--bg-base);
+  font-weight: 600;
+}
+.docs-toc .docs-guide-title {
+  font-weight: 600; color: var(--text-strong);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 8px; padding-bottom: 10px;
+}
+.docs-all {
+  display: inline-block; margin: 0 0 14px 12px;
+  font-size: var(--text-2xs); color: var(--text-muted); text-decoration: none;
+}
+.docs-all:hover { color: var(--text-link); }
+
+/* ── the text itself ────────────────────────────────────────────────────────────────── */
+.docs-main h1, .docs-main h2, .docs-main h3, .docs-main h4 {
+  font-family: var(--font-display); color: var(--text-strong); line-height: 1.25;
+}
+.docs-main h1 { font-size: var(--text-3xl); margin: 0 0 24px; }
+.docs-main h2 { font-size: var(--text-2xl); margin: 40px 0 14px; }
+.docs-main h3 { font-size: var(--text-xl, 1.2rem); margin: 30px 0 10px; }
+.docs-main a { color: var(--text-link); }
+.docs-main a:hover { color: var(--text-link-hover); }
+.docs-main code {
+  font-family: var(--font-mono); font-size: 0.9em;
+  background: var(--bg-base); border: 1px solid var(--border-subtle);
+  border-radius: 5px; padding: 1px 5px;
+}
+.docs-main pre {
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 14px 16px;
+  overflow-x: auto;                /* a diagram or a long command scrolls, not the page */
+}
+.docs-main pre code { background: none; border: 0; padding: 0; font-size: var(--text-sm, 0.88rem); }
+.docs-main table { border-collapse: collapse; width: 100%; margin: 18px 0; display: block; overflow-x: auto; }
+.docs-main th, .docs-main td {
+  border: 1px solid var(--border-subtle);
+  padding: 8px 12px; text-align: left; vertical-align: top;
+}
+.docs-main th { background: var(--bg-base); color: var(--text-strong); }
+.docs-main blockquote {
+  margin: 18px 0; padding: 10px 16px;
+  border-left: 3px solid var(--border-strong);
+  background: var(--bg-base);
+  color: var(--text-muted);
+}
+.docs-main img { max-width: 100%; height: auto; border-radius: 8px; }
+.docs-main hr { border: 0; border-top: 1px solid var(--border-subtle); margin: 36px 0; }
+
+/* pandoc's own prev/next/up strip. Kept — it is genuinely useful for reading straight
+ * through — but demoted, because the contents is now the way to get anywhere. */
+#sitenav { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--border-subtle); font-size: var(--text-2xs); }
+#sitenav a { color: var(--text-muted); text-decoration: none; }
+#sitenav a:hover { color: var(--text-link); }
+
+/* ── narrow screens ─────────────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .docs-shell { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .docs-menu {
+    display: inline-block; margin-left: auto;
+    font: inherit; font-size: var(--text-2xs);
+    background: var(--bg-canvas); color: var(--text-body);
+    border: 1px solid var(--border-default); border-radius: 8px;
+    padding: 4px 12px; cursor: pointer;
+  }
+  .docs-version { margin-left: 0; }
+  /* Folded away by default: on a phone the contents would otherwise push every guide's
+   * first paragraph below the fold. */
+  .docs-side { display: none; position: static; max-height: none; padding: 12px 0; }
+  .docs-side.open { display: block; border-bottom: 1px solid var(--border-subtle); }
+}

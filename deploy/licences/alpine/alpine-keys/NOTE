@@ -1,0 +1,8 @@
+alpine-keys — installed as: alpine-keys
+Licence declared by Alpine: MIT
+
+The public keys apk uses to verify Alpine's package signatures.
+
+Written by the Alpine Linux project. It has no upstream source: its source is the aport
+itself, https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/alpine-keys, which contains no licence file and no copyright notice. Alpine declares
+MIT for it, and no copyright notice has been published for it, so none is reproduced here.

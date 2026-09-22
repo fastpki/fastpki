@@ -1,0 +1,8 @@
+postgresql-common — installed as: postgresql-common
+Licence declared by Alpine: MIT
+
+The scripts that select which installed PostgreSQL major version the client commands run.
+
+Written by the Alpine Linux project. It has no upstream source: its source is the aport
+itself, https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/postgresql-common, which contains no licence file and no copyright notice. Alpine declares
+MIT for it, and no copyright notice has been published for it, so none is reproduced here.

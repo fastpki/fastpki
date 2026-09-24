@@ -1,0 +1,344 @@
+#!/bin/sh
+# FastPKI node first-boot script (cloud-init user-data), rendered by OpenTofu.
+#
+# It does, in order:
+#
+#   1. bring up the interconnect interface
+#   2. mount the data volume and put the three stateful trees on it
+#   3. write an answers file
+#   3a. on Alpine's own image, which is the default: download FastPKI from the release
+#       mirror, check the release signature, and unpack it. On an image built with
+#       deploy/cloud/image FastPKI is already there and this downloads nothing.
+#   4. run fastpki-install-native
+#
+# Nothing is compiled either way: the patched PKCS#11 stack arrives prebuilt in the release
+# package.
+#
+# Runs ONCE per instance. The OpenTofu resource sets user_data_replace_on_change, so
+# editing this template replaces the instances rather than leaving them configured the old
+# way with no signal.
+set -eu
+exec >> /var/log/fastpki-firstboot.log 2>&1
+# ⚠️ THE EXIT STATUS IS RECORDED, IN THE FILE A PROXMOX NODE WRITES: 0 means configured,
+# anything else is the status of the step that failed, and the log above says which. A first
+# boot that failed halfway leaves a node that boots, answers SSH and serves nothing, and the
+# log alone cannot tell that from a first boot still running. The whole script, not only the
+# installer: mounting the data volume can fail before the installer starts.
+trap 'echo $? > /var/log/fastpki-firstboot.rc' EXIT
+echo "=== FastPKI first boot: $(date) ==="
+
+# ── 0. the clock ──────────────────────────────────────────────────────────────────────
+# A CA judges everything by its clock: notBefore/notAfter, CRL thisUpdate/nextUpdate, OCSP
+# response times, CMP message times, and the TLS handshake of every enrolling client. A
+# certificate minted a few minutes fast is refused by relying parties as not yet valid,
+# with an error naming the CLIENT.
+#
+# Alpine's chrony ships `pool pool.ntp.org`, which is on the IPv4 internet. A node deployed
+# with public_ipv4 = false has no route there — no Elastic IP and no NAT gateway, by design
+# — so chronyd runs, never reaches a source, and disciplines nothing. EC2 hands the guest a
+# correct clock at boot, so this is drift rather than a wrong time on day one, and it is
+# invisible until a certificate is refused.
+#
+# ⚠️ EC2's OWN TIME SERVICE IS REACHABLE WITH NO ROUTE, NO GATEWAY AND NO INTERNET, over
+# both families. Measured on an IPv6-only node of this deployment, whose clock was already
+# 1.82 s out: `chronyd -Q` against fd00:ec2::123 and against 169.254.169.123 each returned a
+# measurement in about four seconds, while the configured pool.ntp.org reached its timeout.
+# The IPv4 link-local address answers on an IPv6-only instance too, so both are written and
+# either one alone is enough.
+#
+# ⚠️ AND IT DOES NOT ANSWER PING. Checking this with ICMP says 100% packet loss on a service
+# that is working perfectly; `chronyd -Q` is the test that means anything.
+#
+# This lives here and not in the image's provision.sh because both addresses are EC2 facts.
+# provision.sh is shared with the qemu build that deploy/cloud/boot-check.sh boots locally,
+# where they resolve to nothing. The compose, native and Kubernetes paths get nothing
+# equivalent for the same reason: there the host's clock is the operator's own, and these
+# addresses are wrong everywhere outside EC2.
+#
+# A drop-in rather than an edit: Alpine's chrony.conf carries `confdir /etc/chrony/conf.d`,
+# so this adds sources without touching a distro file, and the pool line stays as a
+# fallback for a deployment that does have a route out.
+if [ -d /etc/chrony ]; then
+    mkdir -p /etc/chrony/conf.d
+    cat > /etc/chrony/conf.d/fastpki-ec2.conf <<'EOF'
+# Amazon Time Sync Service, written by FastPKI's first-boot script. Reachable from any
+# instance without a route off the VPC. Both families: the IPv4 link-local address works
+# on an IPv6-only instance as well, so neither is conditional on the addressing mode.
+server fd00:ec2::123 iburst prefer
+server 169.254.169.123 iburst prefer
+EOF
+    rc-update add chronyd default 2>/dev/null || true
+    rc-service chronyd restart 2>/dev/null || rc-service chronyd start 2>/dev/null || true
+    echo "clock: EC2 time sync configured (fd00:ec2::123, 169.254.169.123)"
+else
+    echo "clock: no /etc/chrony — chrony is not installed, so nothing disciplines the clock"
+fi
+
+# ── 1. the interconnect interface ─────────────────────────────────────────────────────
+# cloud-init writes /etc/network/interfaces afresh at every boot and hands eth1 to dhcpcd,
+# which gives it the address OpenTofu already assigned to the interface. Two things are not
+# right about what dhcpcd does with it on its own, and this section fixes both through
+# dhcpcd, the only place that survives a reboot:
+#
+#   * NO ROUTE TO THE OTHER DATA CENTERS' INTERCONNECT SUBNETS. Each data center's
+#     interconnect is its own subnet, because a subnet cannot span availability zones. With
+#     no route for the others, the kernel sent a peer's database address out of eth0, the
+#     management interface. The peer's interconnect security group admits only its own
+#     members, so it dropped every packet, and `fastpki-mesh` reported "timeout expired".
+#     Measured on a two-data-center deployment: asking for the peer's interconnect address
+#     answered `via <the management router> dev eth0`. The hook below routes each peer subnet through eth1's own
+#     router, on every lease and every renewal.
+#   * A DEFAULT ROUTE THROUGH eth1. dhcpcd adds one, and the interconnect subnet has no route
+#     off the VPC, so it is a blackhole the moment it outranks eth0's. `nogateway` stops it.
+#
+# The routes are also added here directly, because this script runs after dhcpcd has
+# already configured eth1 at first boot.
+IC_IP="${interconnect_ip}"
+IC_PREFIX="${interconnect_prefix}"
+IC_GW="${interconnect_gateway}"
+IC_PEERS="${interconnect_peers}"
+if ip link show eth1 >/dev/null 2>&1; then
+    ip link set dev eth1 up
+    ip addr show dev eth1 | grep -q "$IC_IP" || ip addr add "$IC_IP/$IC_PREFIX" dev eth1
+    cat > /etc/dhcpcd.exit-hook <<EOF
+# FastPKI: reach the other data centers' interconnect subnets through eth1, where the
+# interconnect security group admits the traffic. Written by the first-boot script.
+if [ "\$interface" = eth1 ]; then
+    case "\$reason" in
+        BOUND|RENEW|REBIND|REBOOT|INFORM)
+            for net in $IC_PEERS; do
+                ip route replace "\$net" via "\$new_routers" dev eth1
+            done ;;
+    esac
+fi
+EOF
+    if ! grep -q '^interface eth1' /etc/dhcpcd.conf 2>/dev/null; then
+        printf '\n# FastPKI: the interconnect has no route off the VPC, so no default route through it.\ninterface eth1\nnogateway\n' >> /etc/dhcpcd.conf
+    fi
+    for net in $IC_PEERS; do
+        ip route replace "$net" via "$IC_GW" dev eth1
+    done
+    ip route del default dev eth1 2>/dev/null || true
+    echo "interconnect: eth1 = $IC_IP/$IC_PREFIX, peers via $IC_GW: $${IC_PEERS:-none}"
+else
+    echo "interconnect: no eth1 — single-node deployment, or the ENI did not attach"
+fi
+
+# ── 2. the data volume ────────────────────────────────────────────────────────────────
+# Everything stateful lives on one encrypted EBS volume that is NOT the root volume:
+# the PostgreSQL cluster, /var/pki (transport certificates and the PIN file) and the
+# SoftHSM token store. Replacing an instance must not touch any of it.
+#
+# The volume is attached as /dev/sdf, which on a Nitro instance appears as an NVMe device
+# under a name the kernel chooses. Resolving it by the AWS-assigned alias rather than by
+# guessing nvme1n1 keeps this correct when the device order changes.
+DATA_DEV=""
+i=0
+while [ "$i" -lt 60 ]; do
+    for cand in /dev/disk/by-id/*sdf /dev/sdf /dev/xvdf /dev/nvme1n1; do
+        [ -b "$cand" ] && { DATA_DEV="$cand"; break; }
+    done
+    [ -n "$DATA_DEV" ] && break
+    sleep 2; i=$((i + 1))
+done
+
+if [ -n "$DATA_DEV" ]; then
+    # ⚠️ ONLY FORMAT A BLANK DEVICE. `blkid` returning nothing is the only safe signal that
+    # this volume has never been used; re-creating a filesystem on a volume that already
+    # carries a CA is not recoverable, and a boot script is the last place that should be
+    # able to do it. An existing filesystem is mounted as-is.
+    if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
+        echo "data: formatting blank volume $DATA_DEV"
+        mkfs.ext4 -q -L fastpki-data "$DATA_DEV"
+    else
+        echo "data: $DATA_DEV already carries a filesystem — mounting it unchanged"
+    fi
+    mkdir -p /data
+    grep -q ' /data ' /etc/fstab || printf 'LABEL=fastpki-data /data ext4 defaults,noatime 0 2\n' >> /etc/fstab
+    mount /data 2>/dev/null || mount "$DATA_DEV" /data
+
+    # Bind mounts rather than symlinks: PostgreSQL checks the ownership and mode of its
+    # own data directory, and a symlinked PGDATA is a shape its tooling handles
+    # inconsistently. A bind mount is invisible to everything above it.
+    for pair in "pki:/var/pki" "postgresql:/var/lib/postgresql" "softhsm:/var/lib/softhsm/tokens"; do
+        src="/data/$${pair%%:*}"; dst="$${pair##*:}"
+        mkdir -p "$src" "$dst"
+        grep -q " $dst " /etc/fstab || printf '%s %s none bind 0 0\n' "$src" "$dst" >> /etc/fstab
+        mountpoint -q "$dst" || mount --bind "$src" "$dst"
+    done
+    # PostgreSQL refuses to start on a data directory it does not own, and a freshly
+    # created bind source is root-owned.
+    chown postgres:postgres /var/lib/postgresql 2>/dev/null || true
+    chmod 0750 /var/lib/postgresql 2>/dev/null || true
+    # ⚠️ AND THE VERSION DIRECTORY BENEATH IT, WHICH NOTHING ELSE CREATES CORRECTLY.
+    # `install -d` applies -o/-g/-m to the LAST component only, and Alpine's postgresql init
+    # script creates the whole path in one call:
+    #
+    #     install -d -m 0700 -o postgres -g postgres /var/lib/postgresql/17/data
+    #
+    # so `17` is created as root:root 0700 and postgres cannot traverse into the data
+    # directory it does own. `rc-service postgresql setup` then fails with
+    # `initdb: error: could not access directory ".../17/data": Permission denied`, the
+    # install aborts, and the node comes up with SSH and no CA.
+    #
+    # On an ordinary host the package created that directory long before; a fresh bind mount
+    # hides it, so this appears ONLY with the data volume attached — which is why
+    # deploy/cloud/boot-check.sh passed it: the local QEMU boot has no second disk.
+    #
+    # Derived from the installed server rather than hardcoded, so a major-version bump in the
+    # image does not silently reintroduce it.
+    for _pgdir in /usr/libexec/postgresql[0-9]*; do
+        [ -d "$_pgdir" ] || continue
+        install -d -o postgres -g postgres -m 0750 "/var/lib/postgresql/$${_pgdir##*postgresql}"
+    done
+    echo "data: /data mounted; /var/pki, /var/lib/postgresql and the token store are on it"
+
+    # ⚠️ A REPLACED INSTANCE CANNOT OPEN A DATABASE IT DID NOT INITIALISE, so refuse before
+    # trying. The database password is generated on the node at first boot — see the note
+    # below about why it is not in user-data — and it is written to
+    # /etc/fastpki/bootstrap.conf, which lives on the ROOT volume. The PostgreSQL role that
+    # password belongs to lives in the database, on the DATA volume. Replacing an instance
+    # therefore pairs a new machine's freshly generated password with the role the old
+    # machine created, and nothing on the new machine can connect.
+    #
+    # The token is the other half and survives, because the PIN file is /var/pki/tls/pin —
+    # on the data volume, beside the token it opens. Only the database breaks, and it breaks
+    # completely.
+    #
+    # Left to run, the install half-succeeds and the node comes up unable to reach its own
+    # database — a failure that looks like corruption and is not. `tofu apply` after editing
+    # ami_id is the ordinary way to reach this, and its plan reads as a routine "1 to add,
+    # 1 to destroy".
+    #
+    # The test for "this machine's own secrets" is bootstrap.conf, because that is the file
+    # holding PG_CONNINFO and it is on the root volume. A machine whose operator restored it
+    # by hand passes, which is the documented recovery below.
+    if [ -n "$(find /data/postgresql -maxdepth 3 -name PG_VERSION 2>/dev/null | head -1)" ] &&
+       [ ! -f /etc/fastpki/bootstrap.conf ]; then
+        echo "FATAL: this data volume already holds a FastPKI database, and this machine" >&2
+        echo "       does not have the password that opens it. It was generated on the" >&2
+        echo "       instance that initialised the volume and stored on its root volume," >&2
+        echo "       which is gone. Nothing has been changed. Three ways on:" >&2
+        echo "" >&2
+        echo "       * To update a running deployment, do not replace the instance at all." >&2
+        echo "         Install the new release as a package on the node it is already" >&2
+        echo "         running on — docs/admin-guide.md 14.4. The secrets stay where they" >&2
+        echo "         are and the CA keeps working." >&2
+        echo "       * If you still have the old root volume, attach it and copy" >&2
+        echo "         /etc/fastpki/bootstrap.conf and /etc/conf.d/fastpki across, then" >&2
+        echo "         reboot this machine." >&2
+        echo "       * If this volume's contents are expendable — no CA has been created," >&2
+        echo "         or you have a backup — destroy the volume and apply again. It will" >&2
+        echo "         be recreated empty and this machine will install cleanly." >&2
+        exit 1
+    fi
+else
+    # Refuse rather than quietly install onto the root volume. A CA whose database and
+    # token sit on a disk that disappears with the instance is worse than a node that did
+    # not come up, because it looks like it worked.
+    echo "FATAL: the data volume never appeared. Not installing — a CA must not be" >&2
+    echo "       created on the root volume, which is destroyed with the instance." >&2
+    exit 1
+fi
+
+# ── 3. configure FastPKI ──────────────────────────────────────────────────────────────
+# The same answers file deploy/native/install-native.sh takes interactively, and the same
+# keys deploy/install.sh accepts for a compose deployment. Nothing cloud-specific reaches
+# the installer: it is being told the answers, not told it is in a cloud.
+#
+# ⚠️ NO SECRETS HERE. PG_PASSWORD and PKCS11_PIN are deliberately absent, so the installer
+# generates both from the kernel CSPRNG on the node. user-data is readable by anything on
+# the instance that can reach the metadata service, and it is stored in the account — a
+# database password and a token PIN that protect every CA key on the node have no business
+# in either.
+%{ if web_port < 1024 ~}
+# ⚠️ THE CONSOLE RUNS AS `fastpki`, SO IT CANNOT BIND A PRIVILEGED PORT WITHOUT HELP, and the
+# help has to survive an update. A file capability (setcap cap_net_bind_service) is lost the
+# moment a package or a release tarball replaces the binary — silently, with the service then
+# failing to start for a reason that looks nothing like an upgrade. Lowering the unprivileged
+# range is a property of the machine instead: it persists through /etc/sysctl.d, survives
+# reboots, and applies to IPv6 as well despite the ipv4 name.
+#
+# Set to the console's port exactly, not to 1, so everything below it — 22 and 80 included —
+# stays privileged. Done BEFORE the installer runs, so the console binds correctly the first
+# time rather than failing once and being restarted into place.
+printf 'net.ipv4.ip_unprivileged_port_start=%s\n' '${web_port}' > /etc/sysctl.d/50-fastpki-web-port.conf
+sysctl -w net.ipv4.ip_unprivileged_port_start=${web_port} >/dev/null 2>&1 || true
+echo "port: unprivileged range lowered to ${web_port} so the console can bind it as fastpki"
+%{ endif ~}
+
+ANSWERS=/root/fastpki-answers.env
+umask 077
+cat > "$ANSWERS" <<EOF
+DEPLOYMENT=${dc_count > 1 ? "cluster" : "single"}
+PKI_DNS=${pki_dns}
+%{ if dc_count > 1 ~}
+DC_COUNT=${dc_count}
+DC_INDEX=${dc_index}
+%{ endif ~}
+%{ if dc_count > 1 || ha_enabled ~}
+PG_BIND=$IC_IP
+%{ else ~}
+PG_BIND=127.0.0.1
+%{ endif ~}
+PG_LOCAL=yes
+%{ if ha_enabled ~}
+HA_ENABLED=yes
+%{ endif ~}
+KEY_BACKEND=${key_backend}
+%{ if pkcs11_module != "" ~}
+PKCS11_MODULE=${pkcs11_module}
+%{ endif ~}
+WANT_EST=${contains(protocols, "est") ? "yes" : "no"}
+WANT_ACME=${contains(protocols, "acme") ? "yes" : "no"}
+WANT_CMP=${contains(protocols, "cmp") ? "yes" : "no"}
+WANT_SCEP=${contains(protocols, "scep") ? "yes" : "no"}
+WANT_MS=${contains(protocols, "ms") ? "yes" : "no"}
+WANT_STORE=${contains(protocols, "store") ? "yes" : "no"}
+EOF
+# ⚠️ AND BACK AGAIN, BEFORE ANYTHING IS INSTALLED. 077 is for the answers file, which holds
+# secrets. Left in force, it reached the package unpack on Alpine's own image: the package
+# lists files and not their directories, so `tar` created /usr/lib/pkcs11 itself — mode 0700 —
+# and every service, running as fastpki, could no longer reach the PKCS#11 module. The web,
+# EST and ACME services then crash-looped on "No such file or directory" while first boot
+# reported success.
+umask 022
+
+# ── 3a. FastPKI itself, when the image does not carry it ──────────────────────────────
+# deploy/cloud/firstboot-install.sh, rendered in: on an image built with deploy/cloud/image it
+# only runs fastpki-install-native; on Alpine's own image — the default — it first downloads
+# FastPKI from the release mirror and checks it against the release signature. The public key
+# it checks with comes from the operator's checkout, never from the mirror. The Proxmox first
+# boot embeds the same file, so the two cannot drift apart.
+mkdir -p /usr/local/sbin
+cat > /usr/local/sbin/fastpki-firstboot-install <<'FIRSTBOOT'
+${firstboot_install}
+FIRSTBOOT
+cat > /root/fastpki-release-ecdsa.pub <<'PUBKEY'
+${release_pubkey}
+PUBKEY
+
+echo "=== running fastpki-install-native ==="
+if sh /usr/local/sbin/fastpki-firstboot-install '${release_mirror}' '${release_version}' \
+        /root/fastpki-release-ecdsa.pub "$ANSWERS"; then
+    echo "=== FastPKI node ${dc_index} of ${dc_count} configured ==="
+%{ if web_port != 8090 ~}
+    # The installer takes no port answer, so the console's port is set in the config it
+    # wrote and the service restarted onto it. WEB_PORT reaches the Service, the readiness
+    # check and the console's own listener, so nothing else has to be told.
+    if grep -q '^WEB_PORT=' /etc/fastpki/bootstrap.conf 2>/dev/null; then
+        sed -i 's/^WEB_PORT=.*/WEB_PORT=${web_port}/' /etc/fastpki/bootstrap.conf
+    else
+        printf 'WEB_PORT=%s\n' '${web_port}' >> /etc/fastpki/bootstrap.conf
+    fi
+    rc-service fastpki-web restart >/dev/null 2>&1 || true
+    echo "port: console moved to ${web_port}"
+%{ endif ~}
+else
+    rc=$?
+    echo "FATAL: installing or configuring FastPKI exited $rc. The node is NOT serving." >&2
+    echo "       Read this file (/var/log/fastpki-firstboot.log) from the instance;" >&2
+    echo "       every step is idempotent, so after fixing the cause re-run:" >&2
+    echo "       sh /usr/local/sbin/fastpki-firstboot-install '${release_mirror}' '${release_version}' /root/fastpki-release-ecdsa.pub $ANSWERS" >&2
+    exit $rc
+fi

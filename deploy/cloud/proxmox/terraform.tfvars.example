@@ -1,0 +1,110 @@
+# Copy to terraform.tfvars and edit. Then:
+#
+#   export PROXMOX_VE_API_TOKEN='root@pam!tofu=00000000-0000-0000-0000-000000000000'
+#   tofu init && tofu plan && tofu apply
+#
+# ⚠️ THE TOKEN IS NOT A VARIABLE, AND THAT IS THE POINT. It lives in the environment, so it
+# cannot be committed by someone who runs `git add deploy/cloud/proxmox`. A Proxmox token
+# created with privsep=0 carries its user's full privileges over every VM on the
+# hypervisor, which is a great deal more than this module needs to be trusted with.
+# Create one with:  pveum user token add <user>@<realm> tofu --privsep 0
+
+pve_endpoint = "https://pve.example.org:8006/"
+pve_node     = "pve"
+
+# A lab hypervisor usually presents its own self-signed certificate. Leave this false
+# wherever the endpoint has a certificate you trust.
+pve_insecure = true
+
+# The provider writes cloud-init snippets over SSH, because the API cannot write to a
+# snippets datastore. This account needs write access to it.
+pve_ssh_username = "root"
+pve_ssh_agent    = true
+
+# ⚠️ THE TEMPLATE IS BUILT SEPARATELY — this module never builds an image, exactly as the
+# AWS module never builds an AMI. Bake the qcow2, import it, convert it to a template:
+#
+#   deploy/cloud/image/build-qemu.sh
+#   qm create 9001 --name fastpki-cloud-image --bios ovmf --machine q35 --cpu host \
+#       --scsihw virtio-scsi-single --serial0 socket --vga serial0 --ostype l26
+#   qm set 9001 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
+#   qm disk import 9001 <the qcow2> local-lvm
+#   qm set 9001 --scsi0 local-lvm:vm-9001-disk-1 --boot order=scsi0 --ide2 local-lvm:cloudinit
+#   qm template 9001
+template_vm_id = 9001
+
+deployment_name = "fastpki"
+# Either ONE shared name (round-robin) or exactly node_count names, one per node.
+#
+# One name per node is the default shape: each data center is separately addressable and no
+# key is ever copied (docs/deployment.md 9.1). ONE name requires that every node can SIGN with the
+# CA a client asks for, so that CA's private key has to exist in EVERY node's own token:
+# create it with `fastpki-ca create --replicable` and replicate it to each node over the
+# channel p11_tls opens below. OCSP, CRLs and the store are fungible either way and may
+# share a round-robin record regardless.
+pki_dns         = ["pki-1.example.org"]
+# pki_dns       = ["pki-1.example.org", "pki-2.example.org", "pki-3.example.org"]
+
+node_count  = 1
+first_vm_id = 200
+
+# ⚠️ CHECK THIS RANGE IS FREE BEFORE APPLYING. A bridge is a shared L2 segment: nothing
+# stops you configuring an address another machine already holds, and the result is a VM
+# that answers on port 22 while the traffic reaches somebody else. On the hypervisor,
+# `ip neigh show dev vmbr0` lists what is already out there.
+mgmt_bridge      = "vmbr0"
+mgmt_cidr_prefix = "192.0.2"
+mgmt_first_octet = 40
+mgmt_gateway     = "192.0.2.1"
+nameservers      = ["1.1.1.1"]
+
+# Leave the bridge empty for a single node. With more than one, each gets a second
+# interface on this network for replication.
+interconnect_bridge      = ""
+interconnect_cidr_prefix = "198.51.100"
+
+cores     = 2
+memory_mb = 3072
+disk_gb   = 20
+
+pg_local = true
+
+# softhsm = the bundled token (the lab default); hsm = your own PKCS#11 module, with its
+# absolute path inside the VM and its token label.
+key_backend   = "softhsm"
+pkcs11_module = ""
+pkcs11_token  = "fastpki"
+
+# Each service's key, as the install wizard asks for it. Left out = ec / P-256, and RSA 3072
+# for the SCEP RA.
+service_keys = {
+  # WEB_KEY_ALGO     = "rsa"
+  # WEB_KEY_BITS     = "3072"
+  # SCEP_RA_KEY_BITS = "4096"
+}
+
+# The console and OCSP are always on. A protocol left out here does not bind its port at
+# all — it is absent rather than firewalled.
+enabled_protocols = ["est"]
+
+ci_user         = "fastpki"
+ssh_public_keys = ["ssh-ed25519 AAAA... you@example.org"]
+
+snippets_datastore = "local"
+vm_datastore       = "local-lvm"
+
+# No agent on the host? Name the key instead. A path, not a secret.
+pve_ssh_private_key_file = "/root/.ssh/id_ed25519"
+
+# ── publishing each node's token over mTLS ────────────────────────────────────────────
+#
+# Every node keeps its own token. This publishes it on the INTERCONNECT so a peer can
+# replicate a CA private key out of it into its own token, which is what stops losing a node
+# taking the CAs it held with it. Each end's key is minted INSIDE that node's token by
+# certgen at first boot, so no private key exists in the OpenTofu state or in a file.
+p11_tls      = false
+# p11_tls_port = 12345
+#
+# Blank lets each node generate its own PIN, which is the normal case. Set it to give every
+# node the same one.
+# pkcs11_pin = "…"

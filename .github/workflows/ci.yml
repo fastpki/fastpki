@@ -1,0 +1,483 @@
+name: CI
+
+# ⚠️ WHERE THESE RUN IS ONE REPOSITORY VARIABLE, `FASTPKI_LAB_RUNNERS`.
+#
+#   set to `true`  — the three jobs take the SELF-HOSTED lab runners (`self-hosted, lab-*`).
+#                    That is the private repository, where the lab is free and GitHub-hosted
+#                    minutes are metered against the plan.
+#   unset          — they take GitHub-hosted `ubuntu-latest`. That is the public repository,
+#                    where standard runners are free and unmetered, and where the lab runners
+#                    do not exist. Unset is the default so a fresh clone needs no setting.
+#
+# One file either way: two copies of a workflow this size would drift, and nothing compares
+# them. Set the variable with `gh variable set FASTPKI_LAB_RUNNERS --body true`.
+#
+# ⚠️ WALL-CLOCK ON A SHARED NODE IS THE BINDING CONSTRAINT ON THE LAB, not billed minutes.
+# Those runners are not billed at all — so the shape below is not buying minutes. What it is
+# buying is the lab: a gate run drives load average past 6 on 2 CPUs, and those nodes also
+# serve the deployment somebody may be testing against. One full compile of this tree is ~15
+# minutes, so every trigger is one somebody chose rather than one that fires on its own.
+#
+# A hosted runner is 4 vCPU and 16 GB against the lab's 2 and 4, but its disk is smaller and
+# nothing persists between runs: the buildx cache directories below always miss there, so a
+# hosted run recompiles the tree every time.
+on:
+  # Force a run against any commit without a push. This is how `main` gets checked —
+  # main is deliberately NOT a trigger, because it moves too often to pay for.
+  #
+  # ⚠️ `only` EXISTS BECAUSE A RUN IS AN HOUR OF A NODE SOMEBODY ELSE IS USING. Iterating on
+  # the cloud image means several dispatches in a row while `src/`, `tests/` and the
+  # Dockerfile are untouched — and re-running the suite and the sanitizer lane against
+  # unchanged code re-proves what the last green run already proved. Pick the lane whose
+  # inputs actually moved: `all` whenever product code changes, because there the point is
+  # a verdict on the whole tree.
+  #
+  # ⚠️ `all` DOES NOT INCLUDE THE CLOUD IMAGE, whatever the name suggests. It means the gate
+  # and the sanitizer lane; `cloud-image` below runs on `inputs.only == 'cloud-image'` and
+  # on nothing else — not on `all`, and not on a release-candidate push. That is deliberate,
+  # because `deploy/cloud/` moves on its own schedule, but it does mean a candidate is NOT
+  # covered for the cloud image by pushing the branch. Dispatch that lane separately when
+  # `deploy/cloud/` has changed since the last release.
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Which lanes to run
+        type: choice
+        default: all
+        options:
+          - all
+          - cloud-image
+  # ⚠️ THE RELEASE CANDIDATE IS THE BRANCH THAT MUST BE GREEN. Tagging a commit no gate has
+  # passed is how a broken first release happens.
+  #
+  # ⚠️ THE PATTERN, NOT THE BARE NAME — and this had already failed once. The trigger read
+  # `release-candidate` exactly, while the branch actually cut for 0.1.0 was
+  # `release-candidate-0.1.0`, so pushing it matched nothing and this gate never fired.
+  # The only CI run that branch ever got was a manual workflow_dispatch, and it FAILED —
+  # which is precisely the "tagging a commit no gate has passed" case the comment above
+  # warns about, reached because the guard was spelled one hyphen too narrowly.
+  push:
+    branches: ['release-candidate', 'release-candidate-*']
+  # And once more at the moment a release is published, against what is actually going out.
+  release:
+    types: [published]
+
+  # ⚠️ `pull_request` IS DELIBERATELY ABSENT, and its absence is a security decision as much
+  # as a cost one. On `pull_request` GitHub runs the workflow for a submitted fork branch —
+  # so without the repository's "require approval for all outside collaborators" Actions
+  # setting, an outside PR runs its own code ON A LAB MACHINE before anyone has looked at
+  # it — a self-hosted runner makes that worse than a bill, not better, because the node it
+  # lands on is the one serving the deployment. Approve the PR into release-candidate; the
+  # push trigger above then covers it.
+
+# One run per ref. Pushing twice in five minutes used to occupy the node twice.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── the gate: source checks, then the suite against what we SHIP ────────────────────
+  #
+  # ⚠️ THIS USED TO BE TWO JOBS AND THE SPLIT COST A WHOLE COMPILE. A `fast` lane built the
+  # build stage and ran CORE + SMOKE against it; `gate` then built the build stage AGAIN on
+  # a different runner — no layer cache crosses jobs — and ran the same CORE + SMOKE inside
+  # the runtime image, plus everything else. Two compiles and two runs of the same suites,
+  # for one verdict.
+  #
+  # What the build stage uniquely offers is the SOURCE tier: cppcheck, the build-warnings
+  # gate and the fuzz lane need the compiler and the configured cmake tree, and neither
+  # exists in the runtime image. So that is all it is asked for now. CORE and SMOKE run
+  # once, in the image that ships, which is the only place they prove anything about
+  # ML-DSA, Ed25519-in-token or RSA-PSS token signing anyway.
+  #
+  # A compile error is still red in minutes: the build is the first step.
+  gate:
+    # Skipped only when a dispatch asked for one lane. Every other trigger — a release
+    # candidate push, a published release — runs it, because `only` is empty there.
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
+    runs-on: ${{ vars.FASTPKI_LAB_RUNNERS == 'true' && fromJSON('["self-hosted","lab-amd64"]') || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # buildx + a local cache directory, so the `deps` layer — ~150 apk packages and three
+      # git clones — survives between RUNS. Within a job the local daemon already reuses
+      # layers for free, which is why the runtime build below is nearly instant after the
+      # build stage.
+      #
+      # ⚠️ A DIRECTORY ON THE RUNNER RATHER THAN A CONTAINER REGISTRY. GitHub Packages
+      # storage on a private repository is small and billed — which the self-hosted runners
+      # are not — and the build-stage image is well over a gigabyte, so pushing one per run
+      # would buy a storage bill for nothing. The runner persists, so the cheapest place to
+      # keep the layers is the disk they were built on. Nothing evicts that for us, which is
+      # what the rotate step below exists to handle.
+      #
+      # ⚠️ NO THIRD-PARTY ACTIONS HERE, AND THAT IS NOT STYLE — IT IS WHY THIS WORKFLOW
+      # RAN AT ALL. This job used docker/setup-buildx-action and docker/build-push-action.
+      # The repository allows GitHub-owned actions ONLY (Settings → Actions → Allow select
+      # actions; `github_owned_allowed: true`, `patterns_allowed: []`), so GitHub refused to
+      # create the run: conclusion `startup_failure`, no jobs, no logs, and nothing that
+      # names the cause anywhere a person would look. Every run on every branch failed that
+      # way for 39 commits before anyone noticed, because CI here is manual and nobody
+      # dispatches a workflow expecting it to not exist.
+      #
+      # So the same work is done with the docker CLI, which needs no allowlist. `buildx` is
+      # already on the runner. The docker-container driver is required because the default
+      # `docker` driver cannot EXPORT a cache (`--cache-to` is unsupported there) — and it
+      # is what setup-buildx-action created anyway, so `--load` costs exactly what it did
+      # before. If a third-party action is ever genuinely needed, add it to the repository
+      # allowlist FIRST and dispatch once to prove it, because the failure is silent.
+      # ⚠️ IDEMPOTENT, because the runner is a PERSISTENT machine. On a GitHub-hosted VM
+      # `create` ran once on a clean host; here the builder survives between runs and a bare
+      # `create` fails the second time with "existing instance".
+      - name: Set up a buildx builder that can export a cache
+        run: |
+          docker buildx inspect ci >/dev/null 2>&1 || \
+            docker buildx create --name ci --driver docker-container
+          docker buildx use ci
+
+      # ⚠️ NO actions/cache. On a GitHub-hosted VM the cache had to be uploaded and pulled
+      # back because the machine was destroyed after every run. This runner is a lab node
+      # that persists, so the layers are simply still on its disk — uploading them to
+      # GitHub would be slower AND would spend the repository's 10 GB cache quota to move
+      # data from the machine to itself. The path lives under $HOME rather than /tmp so a
+      # reboot does not silently throw the cache away.
+
+      # ⚠️ A HOSTED RUNNER HAS FAR LESS DISK THAN THE LAB, and this tree's build is large: the
+      # shipped image, then a test image on top of it, then a Postgres and a token stack per
+      # shard. The preinstalled toolchains are worth gigabytes and nothing here uses one, so
+      # they go before the build rather than after it fails. Lab runners skip this: their
+      # disk is their own and those paths do not exist.
+      - name: Free the hosted runner's preinstalled toolchains
+        if: vars.FASTPKI_LAB_RUNNERS != 'true'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          df -h / | tail -1
+
+      # Same reasoning as the sanitizer lane: start from known free space rather than from
+      # whatever the last run left. See the comment on its copy of this step.
+      - name: Reclaim disk before building
+        run: |
+          docker image prune -f
+          docker buildx prune -f --reserved-space 2g || docker buildx prune -f --keep-storage 2g || true
+          df -h / | tail -1
+
+      - name: Build the build stage (compiles every binary)
+        run: |
+          docker buildx build --load --target build -t fastpki-build:ci \
+            --cache-from type=local,src=$HOME/.cache/fastpki/buildx-gate \
+            --cache-to   type=local,dest=$HOME/.cache/fastpki/buildx-gate-new,mode=max \
+            .
+
+      # The three gates that test the SOURCE rather than the shipped binaries. RUN_CORE=0
+      # keeps this to the source tier alone — CORE and SMOKE belong to the image run below,
+      # and running them twice is what this job was rebuilt to stop doing.
+      - name: Source gates — cppcheck, build warnings, fuzz lane
+        run: |
+          docker run --rm \
+            -e OSSL=openssl -e OPENSSL_LIBDIR=/usr/lib \
+            -e RUN_CORE=0 -e RUN_SOURCE=1 -e FASTPKI_ALLOW_HOST_RUN=1 \
+            fastpki-build:ci \
+            bash tests/run_all.sh
+
+      # Reuses every layer the step above just built, on this same runner, for free — the
+      # builder still holds them, so this needs no cache-to of its own.
+      - name: Build the runtime image
+        run: |
+          docker buildx build --load -t fastpki:ci \
+            --cache-from type=local,src=$HOME/.cache/fastpki/buildx-gate \
+            .
+
+      # ⚠️ THE SUITE NEEDS TWO IMAGES, AND FORGETTING THIS ONE FAILS THE LANE IN UNDER A
+      # SECOND. run-in-container.sh derives `<runtime>-testtools:<tag>` from FASTPKI_IMAGE
+      # and refuses to start without it, because the SCEP and CMP test clients were moved
+      # out of the shipped image into the `testtools` stage — which is the whole
+      # point: they must never reach production. deploy/build-image.sh builds both; this
+      # lane drives `docker buildx` directly and so has to do the same.
+      # Nearly free: the `build` stage it copies from is already in the local daemon.
+      - name: Build the test-tools image the suite needs
+        run: |
+          docker buildx build --load --target testtools -t fastpki-testtools:ci \
+            --cache-from type=local,src=$HOME/.cache/fastpki/buildx-gate \
+            .
+
+      # ⚠️ ROTATE, OR THE CACHE GROWS WITHOUT BOUND. `--cache-to` writes a fresh tree rather
+      # than pruning the one it restored from, so exporting onto the restored directory
+      # compounds every run. These are local caches on a persistent runner, so nothing
+      # evicts them for us: the tree grows until the node's disk does, and this node also
+      # serves the lab. Swapping means what gets saved is exactly what this run produced,
+      # and the ~150-package `deps` layer stays warm instead of rebuilding from scratch.
+      # Guarded: the export is skipped when a build did not write one.
+      - name: Rotate the build cache
+        if: always()
+        run: |
+          mkdir -p "$HOME/.cache/fastpki"
+          if [ -d $HOME/.cache/fastpki/buildx-gate-new ]; then
+            rm -rf $HOME/.cache/fastpki/buildx-gate
+            mv $HOME/.cache/fastpki/buildx-gate-new $HOME/.cache/fastpki/buildx-gate
+          fi
+
+      # ⚠️ THE ONLY RUN THAT IS A VERDICT. The runtime image is the only place the patched
+      # p11-kit, the patched SoftHSM and the shipped libcrypto exist together. It is also
+      # where run_all.sh treats a skipped suite as a FAILURE — everything it needs is
+      # installed there on purpose, so a suite that gives up is an image gap, not a fact
+      # about the host. run-in-container.sh is the same script a developer runs, so CI and
+      # a laptop cannot drift.
+      - name: The suite, against the shipped image
+        env:
+          FASTPKI_IMAGE: fastpki:ci
+        run: bash tests/run-in-container.sh
+
+      # ⚠️ THE MACHINE PERSISTS, SO NOTHING RECLAIMS DISK ON ITS OWN. A GitHub-hosted VM was
+      # destroyed after every run and this step would have been pointless; this lab node has
+      # roughly 20 GB free, builds an image per run, and also RUNS the deployment. Left alone
+      # it fills up and the failure looks like a build error rather than a full disk.
+      #
+      # ⚠️ NEVER `docker image prune -a` or a bare `system prune -a` here: those delete
+      # images nothing is *pointing* at, and this node's own compose stack is running from
+      # images that would qualify while its containers are merely stopped. Dangling-only.
+      - name: Reclaim disk
+        if: always()
+        run: |
+          docker image prune -f
+          docker buildx prune -f --keep-storage 4g || docker buildx prune -f
+          df -h / | tail -1
+
+  # ── the security lane ───────────────────────────────────────────────────────────────
+  # ASan + UBSan over pki_lib and every binary.
+  #
+  # ⚠️ IT RUNS IN THE TEST IMAGE NOW, NOT AGAINST THE BUILD STAGE, and the reason is that
+  # the build stage cannot run most of the suite at all. It ships postgresql17-CLIENT and no
+  # server — no initdb, no postgres, no pg_ctl — while 224 suites source tests/pg_helpers.sh
+  # to stand up a throwaway cluster. Every one of those skipped, and a skip prints ALL GREEN,
+  # so this lane reported success while the sanitizers had never entered the code the suite
+  # exists to exercise. (The token stack was a second cause of the same thing and is fixed in
+  # the Dockerfile; the database was the larger one.)
+  #
+  # Running in the test image also makes the rule enforce itself: run_all.sh treats a skipped
+  # suite as a FAILURE when env=test-image, because everything the harness needs is installed
+  # there on purpose. "Nothing skips" stops being something to check and becomes something
+  # the harness refuses to let past.
+  #
+  # ⚠️ AND THE SCOPE IS SET BY THE EVENT, because sanitizers are 2-3x slower and this node
+  # also serves the lab — the cost is somebody else waiting, not a bill:
+  #
+  #   push to release-candidate   CORE + SMOKE. Enough to catch a memory error in the paths
+  #                               every change touches, cheap enough to run on every push.
+  #   release published           the WHOLE suite, PG and root tiers included. A release is
+  #                               the right moment to spend an hour of a lab node on the
+  #                               thorough answer.
+  sanitizers:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all'
+    # ⚠️ A DIFFERENT NODE FROM THE GATE, DELIBERATELY. One runner takes one job at a time, so
+    # sharing `lab-amd64` with the gate put this lane in a queue behind a full container run
+    # rather than beside it. Pinned to its own node (rather than pooling both under one
+    # label) so each lane keeps its own warm buildx cache: the two builds share almost
+    # nothing above the `deps` layer, and a job that lands on the other node starts cold.
+    runs-on: ${{ vars.FASTPKI_LAB_RUNNERS == 'true' && fromJSON('["self-hosted","lab-asan"]') || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker CLI rather than docker/*, for the reason spelled out in the gate job: the
+      # repository allows GitHub-owned actions only, and a workflow that names any other
+      # one is refused before a single job is created.
+      # ⚠️ IDEMPOTENT, because the runner is a PERSISTENT machine. On a GitHub-hosted VM
+      # `create` ran once on a clean host; here the builder survives between runs and a bare
+      # `create` fails the second time with "existing instance".
+      - name: Set up a buildx builder that can export a cache
+        run: |
+          docker buildx inspect ci >/dev/null 2>&1 || \
+            docker buildx create --name ci --driver docker-container
+          docker buildx use ci
+
+      # ⚠️ ITS OWN CACHE DIRECTORY. The sanitizer build passes different CMAKE flags, so
+      # almost nothing above the `deps` layer is shared with the gate job, and a shared path
+      # would have each export overwrite the other's while neither ever hit. The directory
+      # is keyed to the LANE rather than to the node, so the separation holds however the
+      # lanes are distributed — `gate` and `cloud-image` already share `lab-amd64`, and one
+      # `$HOME` between them.
+
+      # ⚠️ RECLAIM BEFORE BUILDING, NOT ONLY AFTER. The `Reclaim disk` step at the end runs
+      # `if: always()`, so every build began with whatever the PREVIOUS run happened to leave —
+      # and on these 25 GB runners that has three times been ~1.9 GB, which is not enough for
+      # the sanitizer image. The suite then died four seconds in with `pg_ctl: could not start
+      # server`, a failure that names nothing about disk and reads as a product fault; it cost
+      # three CI cycles before being recognised. The sanitizer lane is the one that needs this:
+      # its image carries clang's compiler-rt and is several times the runtime image's size.
+      #
+      # Dangling images only, never `prune -a`: these nodes also run deployments, and a bare
+      # `-a` would delete images their stopped containers still need.
+      - name: Free the hosted runner's preinstalled toolchains
+        if: vars.FASTPKI_LAB_RUNNERS != 'true'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          df -h / | tail -1
+
+      - name: Reclaim disk before building
+        run: |
+          docker image prune -f
+          docker buildx prune -f --reserved-space 2g || docker buildx prune -f --keep-storage 2g || true
+          df -h / | tail -1
+
+      - name: Build the RUNTIME image with ASan + UBSan
+        # Alpine/musl gcc has no libasan/libubsan; build the sanitizer variant with clang,
+        # whose compiler-rt runtimes (apk `compiler-rt`) support musl.
+        run: |
+          docker buildx build --load -t fastpki-asan:ci \
+            --build-arg "CMAKE_EXTRA_FLAGS=-DFASTPKI_SANITIZE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++" \
+            --cache-from type=local,src=$HOME/.cache/fastpki/buildx-asan \
+            --cache-to   type=local,dest=$HOME/.cache/fastpki/buildx-asan-new,mode=max \
+            .
+
+      # The companion image run-in-container.sh requires — here `fastpki-asan-testtools:ci`,
+      # derived from FASTPKI_IMAGE. See the gate's copy of this step for why it exists.
+      #
+      # ⚠️ THE SAME --build-arg, OR THIS COMPILES EVERYTHING A SECOND TIME. `testtools`
+      # COPYs from the `build` stage, so a different set of args is a different stage: with
+      # the args it reuses what the step above just built, without them it starts a full
+      # non-sanitized compile. No --cache-to, so the rotation below still exports exactly
+      # what the runtime build produced.
+      - name: Build the test-tools image the suite needs
+        run: |
+          docker buildx build --load --target testtools -t fastpki-asan-testtools:ci \
+            --build-arg "CMAKE_EXTRA_FLAGS=-DFASTPKI_SANITIZE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++" \
+            --cache-from type=local,src=$HOME/.cache/fastpki/buildx-asan \
+            .
+
+      - name: Rotate the build cache
+        if: always()
+        run: |
+          mkdir -p "$HOME/.cache/fastpki"
+          if [ -d $HOME/.cache/fastpki/buildx-asan-new ]; then
+            rm -rf $HOME/.cache/fastpki/buildx-asan
+            mv $HOME/.cache/fastpki/buildx-asan-new $HOME/.cache/fastpki/buildx-asan
+          fi
+
+      - name: The suite under sanitizers, in the test image
+        env:
+          FASTPKI_IMAGE: fastpki-asan:ci
+          # detect_leaks=0: SoftHSM's PKCS#11 module is dlopen'd with RTLD_DEEPBIND, which
+          # the sanitizer runtime warns about but tolerates. abort/halt on any genuine
+          # finding. FASTPKI_TEST_ENV is run-in-container.sh's passthrough; it splits on
+          # whitespace, and neither value contains any.
+          FASTPKI_TEST_ENV: "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "== release: the WHOLE suite under sanitizers =="
+          else
+            echo "== release-candidate: CORE + SMOKE under sanitizers =="
+            export RUN_ROOT=0 RUN_PG=0
+          fi
+          bash tests/run-in-container.sh
+
+      # ⚠️ THE MACHINE PERSISTS, SO NOTHING RECLAIMS DISK ON ITS OWN. A GitHub-hosted VM was
+      # destroyed after every run and this step would have been pointless; this lab node has
+      # roughly 20 GB free, builds an image per run, and also RUNS the deployment. Left alone
+      # it fills up and the failure looks like a build error rather than a full disk.
+      #
+      # ⚠️ NEVER `docker image prune -a` or a bare `system prune -a` here: those delete
+      # images nothing is *pointing* at, and this node's own compose stack is running from
+      # images that would qualify while its containers are merely stopped. Dangling-only.
+      - name: Reclaim disk
+        if: always()
+        run: |
+          docker image prune -f
+          docker buildx prune -f --keep-storage 4g || docker buildx prune -f
+          df -h / | tail -1
+
+  # ── the cloud image ─────────────────────────────────────────────────────────────────
+  #
+  # ⚠️ THE ONLY LANE THAT BOOTS ANYTHING. The gate runs the suite in a container and the
+  # sanitizer lane does the same with ASan; neither has an init, a kernel or cloud-init, so
+  # the artifact a cloud user actually boots — the AMI, and the qcow2 built from the same
+  # provision.sh — had no test at all. provision.sh asserts the cloud-init SERVICE exists in
+  # the image and stops there, which says nothing about user-data ever being consumed.
+  #
+  # ⚠️ IT NEEDS /dev/kvm AND THE RUNNER'S USER IN THE `kvm` GROUP. Without the group the
+  # build falls back to TCG emulation and takes hours rather than minutes — it does not
+  # fail, it just becomes useless, which is the worse failure. `qemu-system-x86_64`,
+  # `qemu-img`, `packer` and `ovmf` (Debian: `apt-get install ovmf`) are host packages on
+  # the lab-amd64 node, and the Prerequisites step below checks every one of them: each
+  # absence otherwise surfaces as a VM that is slow or silent rather than as a package that
+  # is missing.
+  #
+  # ⚠️ ITS OWN JOB, NOT A STEP IN `gate`. One self-hosted runner takes one job at a time,
+  # so this queues rather than competing for the two CPUs a container gate already drives
+  # past load average 6 — and a VM starved of CPU fails by timing out, which reads like a
+  # product bug.
+  cloud-image:
+    # ⚠️ DISPATCH ONLY, BECAUSE THIS NODE CANNOT FINISH THE BUILD. The lane is correct — it
+    # boots the image, cloud-init consumes the seed, doas escalates and the compile starts —
+    # but lab-amd64 has 2 CPUs, shares them with the runner and the lab, and gets through
+    # about 15 of 70 objects an hour. A full build needs roughly four, against any job
+    # timeout worth setting on a node somebody else is using. KVM is already in use
+    # (`-machine type=pc,accel=kvm`), so this is core count, not emulation overhead: the
+    # amazon-ebs source sizes the same build at c7g.2xlarge for exactly this reason.
+    #
+    # So it must not gate a release candidate, which has to be green to be taggable. Run it
+    # by hand — `gh workflow run ci.yml --field only=cloud-image` — on a machine with cores,
+    # when the cloud path has changed. The shipped binaries are covered by `gate` either way;
+    # what only this lane can prove is first boot, cloud-init and surviving a reboot.
+    # ⚠️ CHOSEN, NOT MERELY DISPATCHED — `all` DELIBERATELY EXCLUDES THIS LANE. Every other
+    # trigger in this file is something the node can finish; this one is not, so folding it
+    # into the default means each ordinary dispatch of `main` also queues a build that
+    # occupies the runner for over an hour and then times out. `all` therefore means "every
+    # lane that can produce a verdict here", which is what makes it the sensible default.
+    if: github.event_name == 'workflow_dispatch' && inputs.only == 'cloud-image'
+    runs-on: ${{ vars.FASTPKI_LAB_RUNNERS == 'true' && fromJSON('["self-hosted","lab-amd64"]') || 'ubuntu-latest' }}
+    # ⚠️ THE NUMBER IS THE TEMPLATE'S OWN CEILING PLUS THE REST, not an estimate of a good
+    # run. image/fastpki.pkr.hcl gives the provisioner that compiles FastPKI `timeout =
+    # "60m"`, so a job timeout of 60 would kill the build before its own timeout could
+    # report why. Sixty there, a few minutes for the download, copy, resize and shutdown,
+    # and eleven for boot-check.sh's two five-minute SSH waits either side of the reboot.
+    # A VM that wedges must not hold the node all day — this runner also serves the lab.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prerequisites
+        run: |
+          set -eu
+          for t in qemu-system-x86_64 qemu-img packer; do
+            command -v "$t" >/dev/null || { echo "FATAL: $t is not installed on this runner" >&2; exit 1; }
+          done
+          # ⚠️ THE FIRMWARE IS A PACKAGE, AND ITS ABSENCE IS SILENT. The base is Alpine's
+          # -uefi- cloud image, so a VM started without OVMF runs SeaBIOS, finds no
+          # bootloader and never brings up SSH — packer reports that only after its whole
+          # ssh_timeout, and reports it as a communicator problem. `apt-get install ovmf`
+          # on this node. Resolved by the same helper the build and the boot check use, so
+          # this step cannot pass while either of them fails.
+          . deploy/cloud/ovmf-firmware.sh
+          echo "UEFI firmware: $OVMF_CODE + $OVMF_VARS"
+          # A missing /dev/kvm is not a failure to tolerate quietly: the build still
+          # succeeds under TCG and takes long enough to look like a hang.
+          [ -w /dev/kvm ] || { echo "FATAL: /dev/kvm is not writable — add the runner user to the kvm group" >&2; exit 1; }
+          df -h / | tail -1
+
+      # Same provision.sh as the AMI, emitting a bootable disk instead. Building from HEAD
+      # of the checked-out ref, which is what packer's clean-tree check expects.
+      - name: Build the disk image
+        run: bash deploy/cloud/image/build-qemu.sh --ref "$GITHUB_SHA"
+
+      # Hands it a cloud-init seed exactly as an instance receives one, then asserts the
+      # answers were consumed, the services OpenRC supervises are up, and — the part no
+      # container can answer — that it all survives a reboot.
+      - name: Boot it and check the first-boot path
+        run: bash deploy/cloud/boot-check.sh
+
+      - name: Reclaim disk
+        if: always()
+        run: |
+          rm -rf deploy/cloud/image/output-qemu \
+                 deploy/cloud/image/output-qemu.console.log \
+                 deploy/cloud/image/output-qemu.packer.log
+          df -h / | tail -1

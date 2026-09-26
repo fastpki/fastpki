@@ -1,0 +1,41 @@
+#!/sbin/openrc-run
+# OpenRC service — the audit log forwarder (native equivalent of the compose `auditfwd`
+# service, which carries profile [auditfwd] and is likewise off unless asked for).
+#
+# Not part of the fastpki template: the template maps ${RC_SVCNAME#fastpki-} onto a
+# fastpki-<proto> binary with a single --config argument, and this is fastpki-audit with a
+# subcommand. A symlink would have produced /usr/local/bin/fastpki-auditfwd, which does
+# not exist.
+
+: "${FASTPKI_CONF_D:=/etc/conf.d/fastpki}"
+# shellcheck source=/dev/null
+[ -r "$FASTPKI_CONF_D" ] && . "$FASTPKI_CONF_D"
+
+: "${FASTPKI_CONF:=/etc/fastpki/bootstrap.conf}"
+: "${FASTPKI_BINDIR:=/usr/local/bin}"
+: "${FASTPKI_USER:=fastpki}"
+: "${FASTPKI_LOGDIR:=/var/log/fastpki}"
+
+name="FastPKI audit forwarder"
+description="Follows the audit log and forwards it to the configured sink"
+
+command="${FASTPKI_BINDIR}/fastpki-audit"
+command_args="--config ${FASTPKI_CONF} forward --follow"
+command_user="${FASTPKI_USER}:${FASTPKI_USER}"
+
+supervisor=supervise-daemon
+pidfile="/run/supervise-${RC_SVCNAME}.pid"
+respawn_delay=5
+respawn_max=0
+output_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+error_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+
+depend() {
+    need net
+    use postgresql
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o "${FASTPKI_USER}:${FASTPKI_USER}" "$FASTPKI_LOGDIR" || return 1
+    return 0
+}

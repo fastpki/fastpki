@@ -1,0 +1,139 @@
+#cloud-config
+# FastPKI node first-boot data, rendered by OpenTofu.
+#
+# It writes the answers file and runs deploy/cloud/firstboot-install.sh. On a template built
+# with deploy/cloud/image FastPKI is already there and nothing is downloaded; on Alpine's own
+# cloud image FastPKI is downloaded from the release mirror and checked against the release
+# signature first. Nothing is compiled either way.
+#
+# ⚠️ VENDOR DATA, NOT USER DATA, AND THAT IS DELIBERATE. Proxmox generates its own
+# user-data carrying the login account, its SSH keys and the network configuration.
+# Supplying `user` would replace all of that and we would have to reproduce it correctly;
+# vendor-data is merged alongside it instead, so this file carries only what is ours.
+#
+# ⚠️ NO SECRETS BY DEFAULT. PG_PASSWORD is never here, and PKCS11_PIN is absent too so the
+# installer generates it from the node's own CSPRNG. Cloud-init data is readable by anything
+# on the instance that can reach the config drive, so a token PIN protecting every CA key
+# does not belong in it without reason.
+#
+# Setting pkcs11_pin writes it here instead, giving every node the same PIN — the same thing
+# compose keeps in deploy/.env as FASTPKI_PIN and Kubernetes in the fastpki-secret Secret. Each
+# node still has its own token; this only means they are unlocked by the same secret.
+# ⚠️ THE NAMESERVERS HAVE TO BE APPLIED, NOT MERELY DELIVERED. Proxmox passes them in the
+# network-config, and cloud-init renders them into /etc/network/interfaces as
+# `dns-nameservers` — which on Alpine nothing consumes: ifupdown-ng ships no resolvconf
+# executor and neither openresolv nor resolvconf is installed. So the setting was written
+# and silently never took effect, leaving the node on whatever /etc/resolv.conf the image
+# shipped. cloud-init's own resolv_conf module is enabled in Alpine's cloud.cfg but skips
+# itself ("no applicable config is provided") unless given this, because it reads
+# cloud-config and not the network-config. Measured on a deployed node: every lookup failed
+# while the configured server answered when asked directly.
+#
+# A node that cannot resolve cannot reach its directory, its mesh peers, or the CRL and AIA
+# URLs in the certificates it issues — all of which are names.
+manage_resolv_conf: true
+resolv_conf:
+  nameservers: [${join(", ", formatlist("%q", nameservers))}]
+
+# ⚠️ PG_BIND IS WHAT MAKES A NODE MESHABLE, and this hardcoded loopback. Two things follow
+# from it and both are silent: Postgres listens only on 127.0.0.1, so no peer can open a
+# replication connection at all; and install-native derives PG_TLS_SANS from PG_BIND, so
+# `fastpki-ca pg-tls` issues a database certificate naming 127.0.0.1 — which every peer's
+# sslmode=verify-full then refuses, after the CAs exist and the hard part looks done.
+# The AWS module has always bound to its interconnect; this one had not.
+#
+# ⚠️ AND THIS COMMENT LIVES HERE, NOT BESIDE THE KEY IT EXPLAINS. Everything under
+# `content: |` is a YAML block scalar: a line at column 0 ENDS it, so a comment written
+# next to PG_BIND silently truncates the document. cloud-init then applies nothing —
+# no write_files, no runcmd — and because runcmd is what unlocks the account cloud-init
+# itself locked, the only symptom is that SSH refuses the key it just installed.
+# ⚠️ EXPECTED IN THE LOG, AND NOT A DEFECT — cloud-init reports, on every node whose
+# ci_user is not `alpine`:
+#
+#     distros[ERROR]: Invalid doas rule 'permit nopass alpine' for user '<ci_user>',
+#     not writing any doas rules for user!
+#
+# The rule it is complaining about is Alpine's own `default_user` doas entry in
+# /etc/cloud/cloud.cfg, which hardcodes the name `alpine`; cloud-init refuses to apply a
+# rule naming one user to a different one. Nothing of ours produces it and nothing needs
+# it: the base image ships /etc/doas.d/wheel.conf with `permit nopass :wheel`, and
+# cloud-init puts the configured user in `wheel`. Measured on a deployed node —
+# `id` gives `groups=4(adm),10(wheel),...` and `doas -n id -u` returns 0.
+#
+# Written down here because it has been reported as a finding twice across verification
+# rounds, each time from the log line alone. The capability the message appears to break
+# is one command away from being checked.
+write_files:
+  # deploy/cloud/firstboot-install.sh, the same file the AWS first boot embeds: on an image
+  # built with deploy/cloud/image it only runs fastpki-install-native, and on Alpine's own
+  # cloud image it first downloads FastPKI from the release mirror and checks it against the
+  # release signature. The key it checks with comes from the operator's checkout.
+  - path: /usr/local/sbin/fastpki-firstboot-install
+    permissions: '0755'
+    content: |
+      ${indent(6, firstboot_install)}
+  - path: /root/fastpki-release-ecdsa.pub
+    permissions: '0644'
+    content: |
+      ${indent(6, release_pubkey)}
+  - path: /root/fastpki-answers.env
+    permissions: '0600'
+    content: |
+      DEPLOYMENT=${deployment}
+      PKI_DNS=${pki_dns}
+      DC_INDEX=${dc_index}
+      PG_LOCAL=${pg_local}
+%{ if interconnect_ip != "" ~}
+      PG_BIND=${interconnect_ip}
+%{ else ~}
+      PG_BIND=127.0.0.1
+%{ endif ~}
+      KEY_BACKEND=${key_backend}
+%{ if pkcs11_module != "" ~}
+      PKCS11_MODULE=${pkcs11_module}
+      PKCS11_TOKEN=${pkcs11_token}
+%{ endif ~}
+%{ if p11_tls == "on" ~}
+      P11_TLS=on
+%{ endif ~}
+%{ if pkcs11_pin != "" ~}
+      PKCS11_PIN=${pkcs11_pin}
+%{ endif ~}
+%{ for proto in all_protocols ~}
+      WANT_${upper(proto)}=${contains(enabled_protocols, proto) ? "yes" : "no"}
+%{ endfor ~}
+%{ for k, v in service_keys ~}
+      ${k}=${v}
+%{ endfor ~}
+
+
+runcmd:
+  # ⚠️ CApath NEEDS THE HASH LINKS, not just the files. stunnel verifies against a hashed
+  # directory, so material dropped in by cloud-init is invisible until it is indexed.
+  # Harmless when there is nothing to index.
+  - [ /bin/sh, -c, "for d in /var/pki/tls/p11/clients /var/pki/tls/p11/servers; do [ -d \"$d\" ] && { command -v c_rehash >/dev/null && c_rehash \"$d\" || openssl rehash \"$d\"; }; done >/dev/null 2>&1 || true" ]
+  # ⚠️ FIRST, UNLOCK THE ACCOUNT cloud-init JUST LOCKED, OR NOBODY CAN LOG IN. Proxmox
+  # generates the user-data that creates this account, and it names the user without
+  # `lock_passwd: false` — which defaults to TRUE. So cloud-init installs the SSH key and
+  # then runs `passwd -l`, leaving the shadow field prefixed `!`, and OpenSSH refuses
+  # PUBLIC KEY logins for a locked account unless UsePAM is on, which Alpine does not set.
+  # Measured: the key is written correctly ("Writing to /home/${ci_user}/.ssh/
+  # authorized_keys - wb: [600] 104 b") and every subsequent login is still refused.
+  #
+  # `*`, NOT `passwd -u`. Unlocking strips the `!` and would leave whatever follows it — on
+  # an account created with no password that is the EMPTY string, which is a passwordless
+  # login on a machine holding CA keys. `*` is the marker Alpine's own image uses for its
+  # default account: no password can ever match it, and it is not the `!` that OpenSSH
+  # reads as "account disabled".
+  #
+  # This cannot be fixed in the user-data, because Proxmox generates that and we do not
+  # get to add a key to it. It belongs here for the same reason everything else does: it is
+  # ours, and vendor-data merges alongside what Proxmox wrote rather than replacing it.
+  - [ /bin/sh, -c, "usermod -p '*' ${ci_user} 2>/dev/null || sed -i 's|^${ci_user}:!*:|${ci_user}:*:|' /etc/shadow" ]
+
+  # ⚠️ THE EXIT STATUS IS RECORDED, not just the output. An installer that failed halfway
+  # leaves a node that boots, answers SSH and serves nothing — and without this file the
+  # only way to tell that from a slow first boot is to read the whole log. deploy/cloud/
+  # boot-check.sh asserts on this exact path, so the two agree about what "configured"
+  # means.
+  - [ /bin/sh, -c, "sh /usr/local/sbin/fastpki-firstboot-install '${release_mirror}' '${release_version}' /root/fastpki-release-ecdsa.pub /root/fastpki-answers.env >> /var/log/fastpki-firstboot.log 2>&1; echo $? > /var/log/fastpki-firstboot.rc" ]

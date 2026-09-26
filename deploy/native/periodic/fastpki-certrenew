@@ -1,0 +1,141 @@
+#!/bin/sh
+# Daily renewal of the service TLS certificates FastPKI issues to itself.
+#
+# The compose stack spends a whole container on this — a `while :; sleep 86400` loop in
+# the `certrenew` service — because compose has no scheduler. Alpine does: busybox crond
+# runs /etc/periodic/daily, so the native form is this file and no supervised process.
+#
+# Runs as the unprivileged runtime user: everything it writes lives under /var/pki, which
+# that user owns, and the CA key it signs with is a token object reached over the same
+# socket the services use. Nothing here needs root.
+#
+# Failure is reported, not swallowed — crond mails/logs any output, so a renewal that has
+# been failing for a week is visible instead of being a certificate that quietly expires.
+set -eu
+
+CONF="${FASTPKI_CONF:-/etc/fastpki/bootstrap.conf}"
+USER_NAME="${FASTPKI_USER:-fastpki}"
+
+[ -r "$CONF" ] || exit 0          # not configured yet: nothing to renew, not an error
+
+CONF_D="${FASTPKI_CONF_D:-/etc/conf.d/fastpki}"
+# shellcheck source=/dev/null
+[ -r "$CONF_D" ] && . "$CONF_D"
+
+# ⚠️ PG_BIND GOES TO EVERY COMMAND BELOW, because it is what names this MACHINE. The transport
+# publishes key their row on it, `key sync` takes its per-host lock on it, and the database
+# certificate names it — each falling back to PKI_DNS, which the two hosts of a pair share.
+# Sourcing conf.d sets a shell variable and `su -c` starts a fresh command, so it is passed
+# explicitly, the way certgen is handed PKI_DNS.
+HOST_ENV="PG_BIND='${PG_BIND:-}'"
+
+rc=0
+CREATE=--create-missing
+
+# ── the token transport's own certificates ────────────────────────────────────────────
+#
+# ⚠️ renew-service-certs DOES NOT COVER THESE. It renews what a CA issued — the OCSP
+# responder, the RA credentials, the listeners — and the transport pair is self-signed and
+# PINNED, so it is not a `certs` row and the sweep below never sees it. Their only renewal is
+# certgen running again, which on this deployment shape happened once, at install: at
+# SELFSIGNED_DAYS the tunnel stops handshaking, and it reads like a trust failure rather
+# than an expiry.
+#
+# `--p11-only` re-enters certgen's P11_TLS block alone. Its freshness gate re-issues each
+# certificate once it is within SELFSIGNED_RENEW_DAYS of expiry and does nothing before
+# that, so this is a cheap no-op on almost every run. The key is untouched — it stays the
+# token object it has always been — so only the certificate changes.
+if [ "${P11_TLS:-off}" = "on" ]; then
+    if su -s /bin/sh "$USER_NAME" -c \
+            "P11_TLS=on PKI_DNS='${PKI_DNS:-}' PKCS11_TOKEN='${PKCS11_TOKEN:-fastpki}' \
+             PKCS11_MODULE='${PKCS11_MODULE:-/usr/lib/pkcs11/p11-kit-client.so}' \
+             /usr/share/fastpki/certgen.sh --p11-only"; then
+        # ⚠️ AND REPUBLISH, OR THE RENEWAL REACHES NOBODY. Each end verifies the other
+        # against a trust directory built from what peers published into `p11_transport`,
+        # and those are only refreshed at service start. Renewing the certificate without
+        # publishing it would leave every peer pinning the one this node no longer
+        # presents — the tunnel would break at renewal instead of at expiry.
+        su -s /bin/sh "$USER_NAME" -c \
+            "$HOST_ENV /usr/local/bin/fastpki-config --config '$CONF' p11-server-publish" \
+            || echo "fastpki-certrenew: could not publish this node's transport server certificate" >&2
+        su -s /bin/sh "$USER_NAME" -c \
+            "$HOST_ENV /usr/local/bin/fastpki-config --config '$CONF' p11-client-publish" \
+            || echo "fastpki-certrenew: could not publish this node's transport client certificate" >&2
+        # And take the peers' renewals in the same pass, so trust converges daily in both
+        # directions without anyone restarting a service.
+        su -s /bin/sh "$USER_NAME" -c \
+            "$HOST_ENV /usr/local/bin/fastpki-config --config '$CONF' p11-clients-sync" >/dev/null 2>&1 || true
+        su -s /bin/sh "$USER_NAME" -c \
+            "$HOST_ENV /usr/local/bin/fastpki-config --config '$CONF' p11-servers-sync" >/dev/null 2>&1 || true
+
+        # ⚠️ AND THE KEYS THEMSELVES, FROM EVERY OTHER HOST OF THIS DATA CENTER — the compose
+        # certrenew loop's step. A pair shares one database, so every CA and credential row
+        # reaches both hosts the moment it is created and no KEY ever does, and a key is minted
+        # on whichever host created it: the console behind the pair's one address, or the sweep
+        # below on whichever host took its lock. So each host copies what it is missing from
+        # the other, not only the standby from the primary. After the trust sync above,
+        # because that is what admits this node to the other host's tunnel. --from-peers never
+        # asks another data center: in a mesh a replicable key is opt-in to bound blast radius.
+        SRCPIN=""
+        # The other host's token PIN, when the two hosts were given different ones.
+        [ -f /var/pki/tls/srcpin ] && SRCPIN="--source-pin-file /var/pki/tls/srcpin"
+        ks=0
+        su -s /bin/sh "$USER_NAME" -c \
+            "$HOST_ENV /usr/local/bin/fastpki-ca --config '$CONF' key sync --from-peers $SRCPIN" \
+            || ks=$?
+        # Exit 2 is a key created without --replicable, which can never leave its token, and 3
+        # a host with nobody to copy from; the CLI has already said what each needs, so neither
+        # is reported twice. Anything else may clear on a retry, so nothing is re-minted below.
+        case "$ks" in
+            0|2|3) ;;
+            *) CREATE=""
+               echo "fastpki-certrenew: key sync did not complete — until it does, losing the other" >&2
+               echo "  host of this pair can leave this one unable to sign, and no credential is" >&2
+               echo "  regenerated here." >&2
+               rc=1 ;;
+        esac
+    else
+        CREATE=""
+        echo "fastpki-certrenew: the token transport certificates are not being renewed on" >&2
+        echo "  this node. Once they expire the mTLS tunnel stops handshaking and a peer" >&2
+        echo "  can no longer replicate a CA key out of this token." >&2
+        rc=1
+    fi
+fi
+
+# ── the service certificates ──────────────────────────────────────────────────────────
+#
+# ⚠️ --create-missing --re-issue-self-signed, AS THE COMPOSE certrenew LOOP AND EVERY KUBERNETES
+# SERVER'S renew CONTAINER RUN IT. Bare, a native install never got its OCSP, CMP and SCEP
+# credentials — the CAs are created after install and nothing else mints them, so those
+# listeners refused every transaction — and kept the self-signed HTTPS certificates it started
+# with. Both flags are idempotent and do nothing until a signing CA exists.
+#
+# ⚠️ AFTER THE KEY SYNC, AND WITHOUT --create-missing WHEN THAT SYNC MAY STILL SUCCEED. When a
+# credential's row exists and its key is not in this token, --create-missing mints a replacement
+# — the remedy for a host nothing can copy the key to. Run before the sync, it was the ordinary
+# state of a pair: the second host replaced every credential the first had just made, the first
+# replaced them back the next night, and each day one host's OCSP, CMP and SCEP had keys only
+# the other held.
+if ! su -s /bin/sh "$USER_NAME" -c \
+        "$HOST_ENV /usr/local/bin/fastpki-ca --config '$CONF' renew-service-certs $CREATE --re-issue-self-signed"; then
+    echo "fastpki-certrenew: renew-service-certs failed — service TLS certificates are" >&2
+    echo "  not being renewed on this node. Check 'rc-service fastpki-web status' and the" >&2
+    echo "  CA's key handle; a token that has gone away fails here first." >&2
+    rc=1
+fi
+
+# ── the database's own certificate ────────────────────────────────────────────────────
+#
+# ⚠️ NO CALL IS NEEDED HERE, and adding one back would be a step backwards. The
+# renew-service-certs run above maintains it: pki::maintain_pg_tls is part of that sweep rather
+# than a command of its own. While it WAS a command of its own, this job and the Kubernetes one
+# never called it and compose's call sat inside a branch that is off unless asked for, so the
+# database certificate was issued once by hand and then expired with nothing to replace it —
+# which fails every application's sslmode=verify-full against a database that is up and
+# read-write, the CLIs included, since they share that connection string.
+#
+# fastpki-pgtls (pg-tls-sync follow) is the other half and is already supervised: the sweep
+# ISSUES the certificate, that service copies it to where PostgreSQL reads it and reloads.
+
+exit "$rc"

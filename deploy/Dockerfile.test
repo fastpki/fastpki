@@ -1,0 +1,176 @@
+# The test image: the image we SHIP, plus the tools the harness needs to drive it.
+#
+# Built by tests/run-in-container.sh, which passes the image under test as BASE. It was a
+# heredoc inside deploy/lab-test.sh; it is a file now because what goes into the
+# environment we trust is worth reviewing in a diff.
+#
+# ⚠️ WHY IT DESCENDS FROM THE RUNTIME IMAGE AND NOT FROM THE BUILD STAGE. The runtime image
+# installs a deliberately small package set, so a missing shared library shows up here and
+# would NOT show up in a build-stage image, which carries every -dev package and every
+# transitive dependency. libcrypto, musl and the fastpki-* binaries are the SHIPPED ones —
+# that is the whole value of this run.
+ARG BASE
+# ⚠️ The test clients come from the TESTTOOLS image, not the base. They are deliberately
+# absent from the runtime image (see Dockerfile stage 3b) — a production image must not
+# carry a client that can enrol — and the suites resolve them through build/ (see the
+# symlink loop in tests/run-in-container.sh).
+ARG TOOLS
+# ⚠️ ALIASED AS A STAGE, because `COPY --from=${VAR}` is NOT expanded by BuildKit:
+#     variable expansion is not supported for --from
+# The documented workaround is exactly this — name a stage from the global ARG and copy
+# from the stage.
+FROM ${TOOLS} AS testtools
+
+FROM ${BASE}
+USER root
+
+# The two clients the SCEP and CMP suites drive. Copied from the testtools image rather
+# than the base, because the runtime image deliberately does not carry them.
+COPY --from=testtools /usr/local/bin/scep-testclient /usr/local/bin/scep-testclient
+COPY --from=testtools /usr/local/bin/cmp-testclient  /usr/local/bin/cmp-testclient
+
+# ⚠️ NEVER `apk add` openssl, softhsm, p11-kit OR p11-kit-server HERE.
+#
+#   openssl   — the point of this image is that libcrypto is the one we ship.
+#
+#   softhsm   — the product image builds SoftHSM from source for ML-DSA (Dockerfile stage
+#               2b, -DENABLE_MLDSA=ON). `apk add softhsm` installed Alpine's build OVER it,
+#               so the tier we trust to catch key-type defects drove a WEAKER token than
+#               production: the runtime image advertises CKM_ML_DSA_KEY_PAIR_GEN and
+#               CKM_ML_DSA (mechtype 0x1C / 0x1D) and the test image advertised neither.
+#               Fixed once already; the line is not coming back.
+#
+#   p11-kit / p11-kit-server — THE SAME HAZARD, and this file inherited it. The runtime
+#               image installs both apk packages (Dockerfile:134) and then OVERWRITES
+#               /usr/lib/libp11-kit.so.0 and /usr/lib/pkcs11/p11-kit-client.so with the
+#               PATCHED builds (Dockerfile:142-143), because CKM_ML_DSA and CKM_EDDSA are
+#               dropped by the unpatched RPC relay and must be patched on BOTH sides of
+#               the socket. `apk add p11-kit p11-kit-server` here is a no-op only while
+#               the installed version still satisfies the index. The day Alpine 3.24 bumps
+#               p11-kit, apk upgrades the package, restores the UNPATCHED .so over ours,
+#               and ML-DSA and Ed25519 quietly stop being relayed — in the one environment
+#               we trust, reported as a skip rather than a failure. Both packages are
+#               already in the base. Do not name them.
+#
+# tests/p11kit_patch.sh asks the token what it advertises through the client shim, so this
+# is asserted at runtime rather than argued about in a comment.
+RUN apk add --no-cache \
+        bash coreutils procps \
+        curl jq xxd g++ \
+        postgresql17 postgresql17-client \
+        openldap openldap-clients openldap-back-mdb \
+        xmlsec \
+        iproute2 lsof git patch netcat-openbsd \
+        nodejs \
+        krb5 krb5-server krb5-dev curl-dev \
+        docker-cli openssh-client \
+        certbot \
+        opensmtpd \
+        gettext-envsubst
+# gettext-envsubst: deploy/k8s/apply.sh needs envsubst on the machine it runs on, --render
+# included, and docs/deployment.md 8 says so. Without it apply.sh stops before rendering, so
+# k8s_install_wizard.sh and k8s_interconnect_ports.sh could only fail here.
+# docker-cli and openssh-client are DRIVER tools, not runtime ones, and neither starts a
+# daemon. This image is the only environment that carries the enrolment test clients
+# (scep-testclient, fastpki-cmp), which the shipped image deliberately does not carry, so
+# it is also the only place demo/pki-demo.sh can be driven from against a remote deployment.
+# Driving one needs both: ssh, because the demo repoints ACME_DNS_RESOLVER on the deployment
+# and puts it back, and docker, because its dns-01 and wildcard cells run CoreDNS in a
+# container and pki-bench.sh gates its whole ACME leg on `docker info`. Without them those
+# cells skip for want of a binary while the host's daemon and key sit one bind-mount away.
+#
+#   -v /var/run/docker.sock:/var/run/docker.sock   -v "$HOME/.ssh:/root/.ssh:ro"
+#
+# ⚠️ AND MOUNT THE REPO AT THE SAME PATH INSIDE, e.g. -v /x/FastPKI:/x/FastPKI -w /x/FastPKI.
+# CoreDNS is a SIBLING container started through the host's daemon, so the -v it is given is
+# resolved by the host: a repo mounted at /repo here makes docker create an empty /repo
+# there, CoreDNS starts with no Corefile and exits, and certbot reports only "All
+# authorizations were not finalized".
+#
+# Nothing in the suite passes any of these, and with none mounted both tools are inert.
+# certbot is a HARNESS tool: acme_lifecycle/acme_eab drive the REAL client rather than our
+# own shell JWS, and without it both fail on a missing cb/live/<domain>/cert.pem — which
+# reads like an issuance bug and is a missing package.
+#
+# ⚠️ certbot IS a Python application, so python3 arrives with it whether or not we ask.
+# That is certbot's own runtime and the ONLY reason python is in this image. Nothing we
+# own may invoke it — see tests/suite_exit_honest.sh, which polices that — and python3
+# must never be added here on its own.
+#
+# patch: p11kit_patch.sh applies deploy/p11-kit-mechanisms.patch against a real checkout to
+# prove it still applies. Without patch(1) it skipped -- in the ONE environment tests run in,
+# which is the same as never checking that the patch we ship is still good.
+#
+# netcat-openbsd: audit.sh captures the syslog UDP datagram to prove the audit record leaves
+# the process. BusyBox's nc could not hold the listen open long enough and the cell reported
+# "capture inconclusive" -- a skip that reads like a product doubt and was a toolbox one.
+#
+# nodejs: console_xss, inventory_filters, web_keygen_der and web_p12 unit-test the browser
+# WebCrypto CSR and PKCS#12 builders that ship INSIDE fastpki-web's single-file console.
+# There is no shell substitute for WebCrypto, and the alternative those suites named —
+# "behaviour verified in-browser before deploy" — is not a gate.
+#
+# opensmtpd: notify.sh delivers the expiry emails to a real relay — STARTTLS with AUTH, TLS
+# from the first byte, and a listener without TLS that the notifier must refuse — and reads
+# them back off its delivery agent. A relay deployments actually run, not a stub that would
+# accept whatever the client happened to send.
+#
+# git: public_repo_hygiene and install_wizard read the TRACKED file set. The repo is
+# bind-mounted with its .git intact, so only the binary was ever missing; without it both
+# suites skipped against a tree that was right there.
+#
+# krb5-server: ms_kerberos drives a live SPNEGO round trip, which needs a KDC
+# (kdb5_util / krb5kdc / kadmin.local). fastpki-ms is built with Kerberos support by
+# default now, so the binary half was never the gap.
+#
+# coreutils: GNU timeout, so tests/run_all.sh can bound every suite. procps: pgrep -x and
+# pkill, which the harness uses to find strays. iproute2 (ss) and lsof: two suites wait on
+# a port to be released and one sweeps for listeners; without them those waits are silent
+# no-ops and the result is an intermittent bind failure rather than a clean report.
+
+# ⚠️ dnsstub is a TEST tool, not the product — CMake builds it from tests/tools/, so the
+# shipped image rightly does not carry it. Without it the ACME suites have no DNS server:
+# every authorization stays pending and six of them fail with "authz:notvalid", which reads
+# like a product bug and is a missing binary. Compiling a TEST tool here is fine; compiling
+# any fastpki-* would defeat the entire point of running against the shipped image.
+# ⚠️ libldap MUST BE UPGRADED TO MATCH THE CLIENT TOOLS, AND ONLY libldap.
+#
+# The runtime image carries libldap from whenever its apk layer was cached; the clients
+# added above come from today's index. openldap-clients depends on the loose `so:libldap.so.2`
+# rather than a version, so apk is satisfied — and then every tool refuses to run:
+#
+#     LDAP vendor version mismatch: library 20613, header 20614
+#
+# slapd itself starts and listens perfectly, so the symptom was `ldapsearch` failing the
+# readiness probe and ldap.sh reporting "slapd failed to start" — a message about the
+# server for a fault in the client. ad_template_import.sh then failed eight assertions
+# because its fixture directory never loaded. Both suites had skipped for want of slapd on
+# every host until now, so nothing had ever exercised this.
+#
+# ⚠️ NAMED EXPLICITLY, NEVER A BLANKET `apk upgrade`. Upgrading everything here would pull
+# Alpine's p11-kit and SoftHSM packages back over the PATCHED builds the runtime image
+# installs — the exact hazard the apk warning at the top of this file exists to prevent.
+RUN apk add --no-cache --upgrade libldap
+
+COPY tests/tools/dnsstub.cpp /tmp/dnsstub.cpp
+RUN g++ -O2 -std=c++17 -o /usr/local/bin/dnsstub /tmp/dnsstub.cpp && rm -f /tmp/dnsstub.cpp
+
+# ⚠️ THE SPNEGO CLIENT, BECAUSE ALPINE'S CURL HAS NO GSS-API. `curl -V` on this image lists
+# no GSS-API, so `curl --negotiate` sends no credential at all and ms_kerberos.sh's live
+# round-trip could never run in the one environment tests are allowed to run in. Same
+# escape hatch and same naming rule as dnsstub above: a compiled test tool, NOT named
+# fastpki-*, so the product image's `COPY /src/build/fastpki-*` glob cannot pick it up.
+COPY tests/tools/spnego_post.cpp /tmp/spnego_post.cpp
+RUN g++ -O2 -std=c++17 -o /usr/local/bin/spnego-post /tmp/spnego_post.cpp \
+        -lgssapi_krb5 -lcurl && rm -f /tmp/spnego_post.cpp
+
+# ⚠️ The shipped image has no /run/postgresql — it never runs a Postgres SERVER, only
+# clients. Without this, initdb succeeds and the server dies at startup with
+# "could not create lock file /run/postgresql/.s.PGSQL.5432.lock", which reads like a
+# permissions problem and is really a missing directory.
+RUN mkdir -p /run/postgresql && chown postgres:postgres /run/postgresql
+
+# The environment declares its own identity, in the same file that decides what is
+# installed. A run cannot CLAIM to be the container tier: the image says so or it does not.
+RUN echo test-image > /etc/fastpki-test-env
+WORKDIR /src

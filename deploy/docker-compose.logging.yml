@@ -1,0 +1,52 @@
+# Container-log forwarding — an OVERLAY, applied on top of docker-compose.yml:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.logging.yml up -d ...
+#
+# Every FastPKI binary writes to stderr and nothing else, so forwarding container logs is
+# the container runtime's job rather than the product's. A log driver picks up postgres and
+# the sidecars for free, and it already solves the buffering and back-pressure that an
+# in-process stderr forwarder would have to solve again and get wrong under load.
+#
+# This is the CONTAINER LOG half only. The AUDIT log is a hash-chained table, not a text
+# stream, and is shipped by the `auditfwd` service (profile: auditfwd) — see
+# AUDIT_FORWARD* in the configuration reference.
+#
+# ⚠️ THE DRIVER OPTIONS ARE NOT INTERCHANGEABLE. `syslog-address`, `splunk-url` and the
+# rest belong to one driver each, and Docker rejects the container outright if an option
+# does not match the driver — the service simply fails to start, which is a better failure
+# than silently dropping logs but is still a surprise at deploy time. So this file ships
+# ONE driver, configured in .env, and switching driver means editing the block below rather
+# than only the variable.
+#
+# Set in deploy/.env:
+#   LOG_SYSLOG_ADDRESS=tcp://collector.example.org:514      (or tcp+tls://…, udp://…)
+#   LOG_SYSLOG_TAG={{.Name}}
+#
+# For Splunk specifically, replace `driver: syslog` with `driver: splunk` and the options
+# with splunk-url / splunk-token / splunk-index; Docker's splunk driver posts to the same
+# HTTP event collector the audit shipper can target.
+#
+# On Kubernetes none of this applies: container stdout/stderr is collected by whatever
+# DaemonSet the cluster runs, and the audit shipper is a normal Deployment.
+
+x-logging: &collector
+  driver: ${LOG_DRIVER:-syslog}
+  options:
+    syslog-address: ${LOG_SYSLOG_ADDRESS:?set LOG_SYSLOG_ADDRESS in deploy/.env}
+    tag: ${LOG_SYSLOG_TAG:-{{.Name}}}
+    # Never block the service when the collector is unreachable. A PKI that stops issuing
+    # because a log collector is down has turned an observability outage into an outage.
+    mode: non-blocking
+
+services:
+  postgres:  { logging: *collector }
+  web:       { logging: *collector }
+  ocsp:      { logging: *collector }
+  est:       { logging: *collector }
+  acme:      { logging: *collector }
+  cmp:       { logging: *collector }
+  ms:        { logging: *collector }
+  store:     { logging: *collector }
+  scep:      { logging: *collector }
+  certrenew: { logging: *collector }
+  auditfwd:  { logging: *collector }

@@ -1,0 +1,172 @@
+diff --git a/src/lib/P11Attributes.cpp b/src/lib/P11Attributes.cpp
+index 29d0ac5..5f07aba 100644
+--- a/src/lib/P11Attributes.cpp
++++ b/src/lib/P11Attributes.cpp
+@@ -378,6 +378,9 @@ CK_RV P11Attribute::retrieve(Token *token, bool isPrivate, CK_VOID_PTR pValue, C
+ // Update the value if allowed
+ CK_RV P11Attribute::update(Token* token, bool isPrivate, CK_VOID_PTR pValue, CK_ULONG ulValueLen, int op)
+ {
++    #ifndef NDEBUG
++    if (type == CKA_ALLOWED_MECHANISMS) { fprintf(stderr, "HSM-DEBUG P11Attribute::update ALLOWED_MECHS: op=%d ulValueLen=%lu size=%lu checks=0x%lx\n", op, (unsigned long)ulValueLen, (unsigned long)size, (unsigned long)checks); }
++    #endif
+ 	if (osobject == NULL) {
+ 		ERROR_MSG("Internal error: osobject field contains NULL_PTR");
+ 		return CKR_GENERAL_ERROR;
+@@ -2537,6 +2540,9 @@ bool P11AttrAllowedMechanisms::setDefault()
+ // Update the value if allowed
+ CK_RV P11AttrAllowedMechanisms::updateAttr(Token* /*token*/, bool /*isPrivate*/, CK_VOID_PTR pValue, CK_ULONG ulValueLen, int /*op*/)
+ {
++	#ifndef NDEBUG
++	fprintf(stderr, "HSM-DEBUG updateAttr ALLOWED_MECHS: ulValueLen=%lu\n", (unsigned long)ulValueLen);
++	#endif
+ 	if (ulValueLen == 0 || (ulValueLen % sizeof(CK_MECHANISM_TYPE)) != 0)
+ 	{
+ 		return CKR_ATTRIBUTE_VALUE_INVALID;
+diff --git a/src/lib/P11Objects.cpp b/src/lib/P11Objects.cpp
+index 82228f4..766cdd0 100644
+--- a/src/lib/P11Objects.cpp
++++ b/src/lib/P11Objects.cpp
+@@ -146,6 +146,9 @@ CK_RV P11Object::loadTemplate(Token *token, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG
+ 	// If case 3 or 4 applies to all the requested attributes, then the call will return CKR_OK.
+ 	for (CK_ULONG i = 0; i < ulAttributeCount; ++i)
+ 	{
++		#ifndef NDEBUG
++		if (pTemplate[i].type == CKA_ALLOWED_MECHANISMS) { fprintf(stderr, "HSM-DEBUG loadTemplate ALLOWED_MECHS: i=%lu attr-in-map=%p\n", (unsigned long)i, (void*)attributes[pTemplate[i].type]); }
++		#endif
+ 		P11Attribute* attr = attributes[pTemplate[i].type];
+ 
+ 		// case 2 of the attribute checks
+@@ -159,6 +162,9 @@ CK_RV P11Object::loadTemplate(Token *token, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG
+ 
+ 		// case 1,3,4 and 5 of the attribute checks are done while retrieving the attribute itself.
+ 		CK_RV retrieve_rv = attr->retrieve(token, isPrivate, pTemplate[i].pValue, &pTemplate[i].ulValueLen);
++		#ifndef NDEBUG
++		if (pTemplate[i].type == CKA_ALLOWED_MECHANISMS) { bool ex = osobject ? osobject->attributeExists(pTemplate[i].type) : false; fprintf(stderr, "HSM-DEBUG retrieve ALLOWED_MECHS: rv=%lu len=%lu exists=%d isPrivate=%d\n", (unsigned long)retrieve_rv, (unsigned long)pTemplate[i].ulValueLen, (int)ex, (int)isPrivate); }
++		#endif
+ 		if (retrieve_rv == CKR_ATTRIBUTE_SENSITIVE) {
+ 			// If case 1 applies to any of the requested attributes, then the call should
+ 			// return the value CKR_ATTRIBUTE_SENSITIVE.
+@@ -231,6 +237,9 @@ CK_RV P11Object::saveTemplate(Token *token, bool isPrivate, CK_ATTRIBUTE_PTR pTe
+ 		}
+ 
+ 		// Additonal checks are done while updating the attributes themselves.
++		#ifndef NDEBUG
++		if (pTemplate[i].type == CKA_ALLOWED_MECHANISMS) { fprintf(stderr, "HSM-DEBUG saveTemplate ALLOWED_MECHS: ulValueLen=%lu op=%d pValue=%p\n", (unsigned long)pTemplate[i].ulValueLen, op, (void*)pTemplate[i].pValue); }
++		#endif
+ 		CK_RV rv = attr->update(token,isPrivate, pTemplate[i].pValue, pTemplate[i].ulValueLen, op);
+ 		if (rv != CKR_OK)
+ 		{
+@@ -1247,6 +1256,7 @@ bool P11RSAPrivateKeyObj::init(OSObject *inobject)
+ 	P11Attribute* attrExponent1 = new P11AttrExponent1(osobject);
+ 	P11Attribute* attrExponent2 = new P11AttrExponent2(osobject);
+ 	P11Attribute* attrCoefficient = new P11AttrCoefficient(osobject);
++	P11Attribute* attrAllowedMechanisms = new P11AttrAllowedMechanisms(osobject);
+ 
+ 	// Initialize the attributes
+ 	if
+@@ -1258,7 +1268,8 @@ bool P11RSAPrivateKeyObj::init(OSObject *inobject)
+ 		!attrPrime2->init() ||
+ 		!attrExponent1->init() ||
+ 		!attrExponent2->init() ||
+-		!attrCoefficient->init()
++		!attrCoefficient->init() ||
++		!attrAllowedMechanisms->init()
+ 	)
+ 	{
+ 		ERROR_MSG("Could not initialize the attribute");
+@@ -1270,6 +1281,7 @@ bool P11RSAPrivateKeyObj::init(OSObject *inobject)
+ 		delete attrExponent1;
+ 		delete attrExponent2;
+ 		delete attrCoefficient;
++		delete attrAllowedMechanisms;
+ 		return false;
+ 	}
+ 
+@@ -1282,6 +1294,7 @@ bool P11RSAPrivateKeyObj::init(OSObject *inobject)
+ 	attributes[attrExponent1->getType()] = attrExponent1;
+ 	attributes[attrExponent2->getType()] = attrExponent2;
+ 	attributes[attrCoefficient->getType()] = attrCoefficient;
++	attributes[attrAllowedMechanisms->getType()] = attrAllowedMechanisms;
+ 
+ 	initialized = true;
+ 	return true;
+diff --git a/src/lib/SoftHSM.cpp b/src/lib/SoftHSM.cpp
+index e5cd0ca..832823a 100644
+--- a/src/lib/SoftHSM.cpp
++++ b/src/lib/SoftHSM.cpp
+@@ -2177,7 +2177,7 @@ CK_RV SoftHSM::C_FindObjectsInit(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pT
+ 								delete findOp;
+ 								return CKR_GENERAL_ERROR;
+ 							}
+-						}
++				}
+ 						else
+ 							bsAttrValue = attr.getByteStringValue();
+ 
+@@ -7900,14 +7900,14 @@ CK_RV SoftHSM::C_UnwrapKey
+ 						if (attr != NULL)
+ 						{
+ 							return CKR_TEMPLATE_INCONSISTENT;
+-						}
++				}
+ 						attr = &secretAttribs[i];
+ 						ByteString value;
+ 						it->second.peekValue(value);
+ 						if (attr->ulValueLen != value.size())
+ 						{
+ 							return CKR_TEMPLATE_INCONSISTENT;
+-						}
++				}
+ 						if (memcmp(attr->pValue, value.const_byte_str(), value.size()) != 0)
+ 						{
+ 							return CKR_TEMPLATE_INCONSISTENT;
+@@ -10014,6 +10014,12 @@ CK_RV SoftHSM::generateRSA
+ 
+ 		if (rv == CKR_OK)
+ 			rv = this->CreateObject(hSession,privateKeyAttribs,privateKeyAttribsCount,phPrivateKey,OBJECT_OP_GENERATE);
++			#ifndef NDEBUG
++			fprintf(stderr, "HSM-DEBUG genRSA CreateObject done: rv=%lu\n", (unsigned long)rv);
++			#endif
++			#ifndef NDEBUG
++			if (rv == CKR_OK) { OSObject* __o = (OSObject*)handleManager->getObject(*phPrivateKey); bool __ex = __o ? __o->attributeExists(CKA_ALLOWED_MECHANISMS) : false; fprintf(stderr, "HSM-DEBUG genRSA after CreateObject: exists=%d len=%lu\n", (int)__ex, __ex ? (unsigned long)__o->getAttribute(CKA_ALLOWED_MECHANISMS).getMechanismTypeSetValue().size() : 0); }
++			#endif
+ 
+ 		// Store the attributes that are being supplied by the key generation to the object
+ 		if (rv == CKR_OK)
+@@ -10021,7 +10027,14 @@ CK_RV SoftHSM::generateRSA
+ 			OSObject* osobject = (OSObject*)handleManager->getObject(*phPrivateKey);
+ 			if (osobject == NULL_PTR || !osobject->isValid()) {
+ 				rv = CKR_FUNCTION_FAILED;
+-			} else if (osobject->startTransaction()) {
++			} else {
++				bool has_allowed = osobject->attributeExists(CKA_ALLOWED_MECHANISMS);
++				OSAttribute saved_allowed((std::set<CK_MECHANISM_TYPE>()));
++				#ifndef NDEBUG
++				fprintf(stderr, "HSM-DEBUG genRSA has_allowed=%d\n", (int)has_allowed);
++				#endif
++				if (has_allowed) { saved_allowed = osobject->getAttribute(CKA_ALLOWED_MECHANISMS); }
++				if (osobject->startTransaction()) {
+ 				bool bOK = true;
+ 
+ 				// Common Key Attributes
+@@ -10074,6 +10087,12 @@ CK_RV SoftHSM::generateRSA
+ 				bOK = bOK && osobject->setAttribute(CKA_EXPONENT_1,exponent1);
+ 				bOK = bOK && osobject->setAttribute(CKA_EXPONENT_2, exponent2);
+ 				bOK = bOK && osobject->setAttribute(CKA_COEFFICIENT, coefficient);
++				if (has_allowed) {
++					bOK = bOK && osobject->setAttribute(CKA_ALLOWED_MECHANISMS, saved_allowed);
++					#ifndef NDEBUG
++					fprintf(stderr, "HSM-DEBUG genRSA restored allowed_mechs bOK=%d\n", (int)bOK);
++					#endif
++				}
+ 
+ 				if (bOK)
+ 					bOK = osobject->commitTransaction();
+@@ -10086,6 +10105,7 @@ CK_RV SoftHSM::generateRSA
+ 				rv = CKR_FUNCTION_FAILED;
+ 		}
+ 	}
++	}
+ 
+ 	// Clean up
+ 	rsa->recycleKeyPair(kp);

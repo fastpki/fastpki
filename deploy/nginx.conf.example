@@ -1,0 +1,108 @@
+# Example nginx reverse proxy in front of the FastPKI binaries.
+#
+# NOT PART OF THE PRODUCT. A reverse proxy or load balancer is the operator's
+# INFRASTRUCTURE — it differs per site (cloud LB, haproxy, nginx, DNS) and FastPKI
+# neither ships nor requires one. This file is kept for OUR OWN testing, and as a
+# worked example of the headers the EST mTLS path expects. Do not read it as the
+# recommended deployment.
+#
+# Responsibilities of the proxy:
+#   - terminate TLS for the public hostname,
+#   - optionally request a client certificate (mTLS) for EST and forward the
+#     verification result + subject DN as headers the EST binary consumes,
+#   - route each protocol path to its backend port.
+#
+# The FastPKI binaries themselves speak plain HTTP on loopback; keep them bound
+# to 127.0.0.1 (set *_BIND=127.0.0.1 in bootstrap.conf) so only nginx is exposed.
+
+upstream fastpki_ocsp  { server 127.0.0.1:8080; }
+upstream fastpki_est   { server 127.0.0.1:8443; }
+upstream fastpki_acme  { server 127.0.0.1:8444; }
+upstream fastpki_cmp   { server 127.0.0.1:8445; }
+upstream fastpki_ms    { server 127.0.0.1:8446; }
+upstream fastpki_store { server 127.0.0.1:8447; }
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name pki.example.org;
+
+    ssl_certificate     /etc/ssl/pki.example.org/fullchain.pem;
+    ssl_certificate_key /etc/ssl/pki.example.org/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # --- Optional mTLS for EST -----------------------------------------------
+    client_max_body_size 256k;   # CSRs / CMP messages are small
+
+    # ---- OCSP + CRL (RFC 6960) ----------------------------------------------
+    location /ocsp                { proxy_pass http://fastpki_ocsp; }
+    location = /pki/signing_ca.crl { proxy_pass http://fastpki_ocsp; }
+
+    # ---- EST (RFC 7030) -----------------------------------------------------
+    # NOTE: fastpki-est terminates TLS itself (httplib::SSLServer, EST_CERT /
+    # EST_KEY) because RFC 7030 mandates HTTPS.
+    #
+    # ⚠️ This location is for HTTP Basic clients ONLY (RFC 7030 §3.2.3).
+    # Terminating TLS here re-originates the connection, so the client's own
+    # certificate never reaches EST — and EST no longer accepts a proxy's word for
+    # it. The CLIENT_CERT_VERIFY / SUBJECT_DN headers that used to be forwarded
+    # here are GONE from the product: any client could set them itself, and the
+    # shipped compose publishes est:8443 directly, so they were an authenticate-as-
+    # anyone bypass rather than a proxy integration.
+    #
+    # If you rely on EST client-certificate authentication, do NOT terminate TLS.
+    # Pass the TCP connection through at L4 — the `stream {}` block below, or plain
+    # DNAT — so the handshake reaches the one process that can verify it, and set
+    # EST_CLIENT_CA_ID / EST_CLIENT_CA_BUNDLE on fastpki-est.
+    location /.well-known/est/ {
+        proxy_set_header Authorization      $http_authorization;  # HTTP Basic
+        proxy_pass https://fastpki_est;
+        proxy_ssl_verify off;   # backend cert is internal/self-signed
+    }
+
+    # ---- ACME (RFC 8555) ----------------------------------------------------
+    # fastpki-acme terminates its own TLS (HTTPS-only, ACME_CERT/ACME_KEY), so
+    # re-encrypt to it. Set BASE_URL=https://<public-host> so the directory
+    # advertises the right URLs (otherwise it reflects the request Host).
+    location /acme/ {
+        proxy_pass https://fastpki_acme;
+        proxy_ssl_verify off;   # backend cert is internal/self-signed
+    }
+
+    # ---- CMP (RFC 4210) -----------------------------------------------------
+    location /cmp { proxy_pass http://fastpki_cmp; }
+
+    # ---- MS-XCEP / MS-WSTEP (HTTPS-only backend) ----------------------------
+    location /msxcep  { proxy_pass https://fastpki_ms; proxy_ssl_verify off; }
+    location /mswstep { proxy_pass https://fastpki_ms; proxy_ssl_verify off; }
+
+    # ---- RFC 4387 cert/CRL store --------------------------------------------
+    location /certificates/search { proxy_pass http://fastpki_store; }
+    location /crls/search         { proxy_pass http://fastpki_store; }
+}
+
+# ACME HTTP-01 validation: the FastPKI ACME server validates challenges by
+# fetching http://<identifier>/.well-known/acme-challenge/<token> from the
+# *client*, so this proxy does not need to serve that path. Port 80 is only
+# relevant on the machines being issued certs, not on the CA.
+
+# ---- Option (b): L4 passthrough — REQUIRED for EST client-certificate auth ---
+# Use this INSTEAD of the EST location block above whenever EST_CLIENT_CA_ID or
+# EST_CLIENT_CA_BUNDLE is set. The client's TLS handshake — and with it the client
+# certificate — must reach fastpki-est unbroken, because the header path is gone
+# and there is no longer any way for a proxy to report what it verified.
+# Put EST on its own hostname/port so port routing is unambiguous. This is a
+# top-level context, not inside `server {}`.
+#
+# ⚠️ NO `ssl` ON THE LISTEN LINE. `listen 8443 ssl` terminates TLS here, which is
+# exactly the case that does not work: nginx completes the handshake, the client
+# certificate stops at nginx, and EST sees an anonymous caller. Forward TCP.
+# Plain DNAT (iptables/nftables) to 8443 does the same job with no proxy at all.
+#
+# stream {
+#     upstream est_backend { server 127.0.0.1:8443; }
+#     server {
+#         listen 8443;                     # public EST port — NOT `ssl`
+#         proxy_pass est_backend;          # raw TCP to EST, which speaks TLS itself
+#     }
+# }

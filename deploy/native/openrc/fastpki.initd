@@ -1,0 +1,149 @@
+#!/sbin/openrc-run
+# OpenRC template service — one instance per FastPKI protocol binary.
+#
+# This file is installed as /etc/init.d/fastpki and SYMLINKED once per protocol:
+#
+#   /etc/init.d/fastpki-ocsp -> fastpki      runs /usr/local/bin/fastpki-ocsp
+#   /etc/init.d/fastpki-est  -> fastpki      runs /usr/local/bin/fastpki-est
+#   ... web, acme, cmp, ms, store, scep
+#
+# which is the OpenRC equivalent of the systemd template unit in deploy/fastpki@.service
+# (net.lo / net.eth0 is the same pattern in Alpine's own tree). The instance name comes
+# from ${RC_SVCNAME}, so adding a protocol is a symlink, not a copy of this file.
+#
+# ⚠️ supervise-daemon, NOT start-stop-daemon, AND respawn_max=0. This is the single
+# integration point where a native install differs from compose in a way that BREAKS the
+# product rather than merely looking different, so it is worth stating plainly:
+#
+# FastPKI is crash-only by design. Three separate paths call std::_Exit(0) — a CLEAN exit,
+# status 0 — and every one of them expects to be restarted:
+#
+#   * exit_if_token_died() / token_died()  (src/lib/endpoint_gate.cpp) when a pkcs11:
+#     handle goes dead because SoftHSM or the p11-kit server restarted. A PKCS#11 module
+#     is initialised once per process, so no reload can recover it; only a new process can.
+#   * the gate_protocol() watcher when <PROTO>_ENABLED is flipped to false in the console:
+#     the process exits so it comes back at the blocked-start poll loop with its port shut.
+#   * the same watcher on a <PROTO>_RESTART_AT marker.
+#
+# compose supplies that with `restart: unless-stopped`. OpenRC's DEFAULT supervisor,
+# start-stop-daemon, does not respawn at all — the service would simply stay down, and the
+# console would show a protocol that was re-enabled and never came back. supervise-daemon
+# does respawn, but its default respawn_max=10 is a budget, not a policy: a deployment
+# whose token restarts eleven times over a year would exhaust it and stop. Neither of the
+# two exits above is a failure, so there is no failure count to bound. respawn_max=0
+# (unlimited) is the setting that matches the design.
+#
+#
+# ⚠️ MEASURED, NOT REASONED. In a container running OpenRC, three otherwise identical
+# services whose command exits 0 immediately:
+#
+#   start-stop-daemon (OpenRC's default)   started ONCE, never again
+#   supervise-daemon, default respawn_max  gave up after 6 restarts
+#   supervise-daemon, respawn_max=0        still restarting at 14, and counting
+#
+# So the default supervisor turns "switch a protocol back on in the console" into "the
+# protocol is permanently down, with nothing in any log", and the default BUDGET turns it
+# into the same thing on a deployment whose token has restarted a few times. Neither is a
+# failure to budget for. deploy/native/run-check.sh re-runs this against a real
+# fastpki service.
+#
+# The blocked-START path deliberately does NOT exit — it polls — so there is no
+# crash loop to guard against here.
+#
+# Configuration is /etc/conf.d/fastpki, shared by every instance (OpenRC would otherwise
+# look for /etc/conf.d/fastpki-ocsp and friends, i.e. one copy per protocol).
+
+: "${FASTPKI_CONF_D:=/etc/conf.d/fastpki}"
+# shellcheck source=/dev/null
+[ -r "$FASTPKI_CONF_D" ] && . "$FASTPKI_CONF_D"
+
+: "${FASTPKI_CONF:=/etc/fastpki/bootstrap.conf}"
+: "${FASTPKI_BINDIR:=/usr/local/bin}"
+: "${FASTPKI_USER:=fastpki}"
+: "${FASTPKI_LOGDIR:=/var/log/fastpki}"
+
+proto="${RC_SVCNAME#fastpki-}"
+
+name="FastPKI ${proto}"
+description="FastPKI ${proto} listener"
+
+command="${FASTPKI_BINDIR}/fastpki-${proto}"
+command_args="--config ${FASTPKI_CONF}"
+command_user="${FASTPKI_USER}:${FASTPKI_USER}"
+
+supervisor=supervise-daemon
+pidfile="/run/supervise-${RC_SVCNAME}.pid"
+respawn_delay=2
+# 0 = unlimited. See the header: a clean exit is a normal event here, not a failure.
+respawn_max=0
+output_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+error_log="${FASTPKI_LOGDIR}/${RC_SVCNAME}.log"
+
+# Every app reaches the token through the p11-kit client shim over the server's socket,
+# exactly as the compose services do — the app never loads SoftHSM in-process, because
+# that combination deadlocks (SoftHSM's OpenSSL backend re-enters libcrypto while
+# libcrypto holds a lock, and a hang never returns). PKCS11_MODULE points at a vendor .so
+# instead for KEY_BACKEND=hsm, and then p11-kit is out of the path entirely.
+export P11_KIT_SERVER_ADDRESS="${P11_KIT_SERVER_ADDRESS:-unix:path=/run/p11/pkcs11.sock}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/p11}"
+export PKCS11_MODULE="${PKCS11_MODULE:-/usr/lib/pkcs11/p11-kit-client.so}"
+[ -n "${ACME_DNS_RESOLVER:-}" ] && export ACME_DNS_RESOLVER
+# The console's Endpoints health probe: every listener runs on this host. Without it the
+# console dialled the compose service names (est, acme, …) and showed every protocol down.
+export HEALTH_PROBE_HOST="${HEALTH_PROBE_HOST:-127.0.0.1}"
+# ⚠️ WHICH MACHINE THIS IS, AND WHAT IT FOLLOWS. The console's reporter and `fastpki-ca key
+# sync` read these three from the ENVIRONMENT, as they do under compose, where .env reaches
+# every service. Sourced but not exported, they reached nothing: every native host reported
+# under PKI_DNS — which the two hosts of a pair share, so the pair was one row that the two
+# consoles overwrote in turn — and a standby never showed "Sync keys now", because its report
+# said neither `standby_of` nor `p11_tls`. None of the three is a secret.
+[ -n "${PG_BIND:-}" ] && export PG_BIND
+[ -n "${P11_TLS:-}" ] && export P11_TLS
+[ -n "${STANDBY_OF:-}" ] && export STANDBY_OF
+
+# ⚠️ TWO SECRETS ARE DELIBERATELY NOT EXPORTED HERE, and the omission is the point.
+#
+#   PG_CONNINFO  carries the database password. It lives in ${FASTPKI_CONF} (0640,
+#                root:fastpki), which is where the config loader looks and where the
+#                product says the one bootstrap key belongs. Exporting it would put the
+#                password in /proc/<pid>/environ, readable for the life of the process.
+#   FASTPKI_PIN  is the token PIN. /etc/conf.d/fastpki defines it for ONE consumer —
+#                fastpki-token's first-boot token init — and sourcing a file sets a
+#                shell variable without exporting it, so it stops here. The services are
+#                given PKCS11_PIN_FILE and read the PIN off disk (0400, fastpki-owned)
+#                instead, which is exactly what the compose stack does.
+#
+# If you add an `export` to this file, check first whether the value is a secret.
+
+depend() {
+    need net
+    # The bundled SoftHSM sidecar is in the path ONLY when PKCS11_MODULE is the p11-kit
+    # client shim (KEY_BACKEND=softhsm). Point it at a vendor module — CloudHSM, a
+    # network HSM, a card — and the app loads that module directly, p11-kit is out of the
+    # picture, and there is no local sidecar to wait for. An unconditional `need` here
+    # would make an HSM-backed node refuse to start a service it does not depend on.
+    case "${PKCS11_MODULE}" in
+        */p11-kit-client.so) need fastpki-token ;;
+    esac
+    # `use`, not `need`, for postgresql: on a mesh node the database may be on another
+    # host, in which case there is no local service and `need` would refuse to start.
+    use postgresql
+    after firewall
+}
+
+start_pre() {
+    # The template itself is not a runnable service: /etc/init.d/fastpki would resolve
+    # to fastpki-fastpki and fail with a confusing "command not found" from the
+    # supervisor rather than from here.
+    if [ "$RC_SVCNAME" = "fastpki" ]; then
+        eerror "fastpki is a TEMPLATE service and is never started directly."
+        eerror "Start an instance instead, e.g.:  rc-service fastpki-ocsp start"
+        return 1
+    fi
+    if [ ! -x "$command" ]; then
+        eerror "$command is missing or not executable — is FastPKI installed?"
+        return 1
+    fi
+    checkpath -d -m 0750 -o "${FASTPKI_USER}:${FASTPKI_USER}" "$FASTPKI_LOGDIR" || return 1
+    return 0
+}

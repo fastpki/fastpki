@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>$pagetitle$ — FastPKI</title>
+$if(subtitle)$<meta name="fastpki-version" content="$subtitle$">$endif$
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/assets/css/styles.css">
+<link rel="stylesheet" href="/assets/css/site.css">
+<link rel="stylesheet" href="/docs/docs.css">
+<!-- The site decides light or dark before first paint and remembers the choice; without
+     this the guides would flash the wrong theme on every page, and a guide is read a page
+     at a time. Same code and same storage key as every other page on the site. -->
+<script>
+  (function () {
+    try {
+      var stored = localStorage.getItem("fastpki-theme");
+      var theme = stored || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    } catch (e) {
+      document.documentElement.setAttribute("data-theme", "light");
+    }
+  })();
+</script>
+</head>
+<body class="docs-body">
+<header class="docs-top">
+  <a class="docs-brand" href="/">Fast<b>PKI</b></a>
+  <span class="docs-sep">/</span>
+  <a class="docs-crumb" href="/docs/">Documentation</a>
+$if(subtitle)$  <span class="docs-version">$subtitle$</span>$endif$
+  <button class="docs-menu" type="button" aria-label="Contents" aria-expanded="false">Contents</button>
+</header>
+<div class="docs-shell">
+  <aside class="docs-side" id="docs-side">
+@@SIDEBAR@@
+  </aside>
+  <main class="docs-main">
+$body$
+  </main>
+</div>
+<script>
+  // The contents is a sidebar on a wide screen and a disclosure on a narrow one. No
+  // framework: one class toggle, so a guide page carries nothing it does not need.
+  (function () {
+    var b = document.querySelector(".docs-menu"), s = document.getElementById("docs-side");
+    if (!b || !s) return;
+    b.addEventListener("click", function () {
+      var open = s.classList.toggle("open");
+      b.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  })();
+</script>
+</body>
+</html>

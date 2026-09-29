@@ -1,0 +1,8 @@
+alpine-base — installed as: alpine-release
+Licence declared by Alpine: MIT
+
+The metapackage that defines an Alpine system, and /etc/alpine-release.
+
+Written by the Alpine Linux project. It has no upstream source: its source is the aport
+itself, https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/alpine-base, which contains no licence file and no copyright notice. Alpine declares
+MIT for it, and no copyright notice has been published for it, so none is reproduced here.

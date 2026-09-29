@@ -1,0 +1,8 @@
+krb5-conf — installed as: krb5-conf
+Licence declared by Alpine: MIT
+
+The default /etc/krb5.conf that krb5-libs reads.
+
+Written by the Alpine Linux project. It has no upstream source: its source is the aport
+itself, https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/krb5-conf, which contains no licence file and no copyright notice. Alpine declares
+MIT for it, and no copyright notice has been published for it, so none is reproduced here.

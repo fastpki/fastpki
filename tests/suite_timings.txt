@@ -1,0 +1,269 @@
+# Per-suite wall-clock seconds, used ONLY to balance shards (FASTPKI_SHARD in run_all.sh).
+#
+# ⚠️ THIS IS A HINT, NEVER A GATE. Nothing fails because a number here is stale or missing:
+# an unknown suite is assumed average, and a wrong number costs a slightly uneven run and
+# nothing else. Do not add assertions against it and do not let anything read it as a
+# performance budget — the moment it becomes a gate, every legitimate slowdown becomes a red
+# run and the file starts getting edited to keep the build green.
+#
+# Why it exists: round-robin sharding assigns by position in the tier arrays, which knows
+# nothing about duration. Measured at 6 shards that put 394s of work in one shard and 157s
+# in another, so a third of the fleet sat idle while the run waited on the slowest.
+#
+# ⚠️ THESE ARE THE WORST DURATIONS OBSERVED, NOT THE TYPICAL ONES, AND THAT IS DELIBERATE.
+# Under-estimating a long suite is the expensive mistake: the scheduler packs work in
+# beside it and the whole run waits. Over-estimating costs an idle shard and nothing else.
+# The first version of this file used typical numbers and made the run SLOWER than the
+# round-robin it replaced (7m10s against 6m42s) by recording acme_lifecycle.sh at 154s.
+#
+# The reason it is not 154s is worth knowing before trusting any number here: a suite's
+# volatile
+acme_account_authz.sh 5
+acme_alpn_responder.sh 3
+acme_baseurl.sh 4
+acme_caa.sh 21
+acme_cert_shape.sh 4
+acme_cross_ca.sh 5
+acme_default_eab.sh 4
+acme_dns01.sh 4
+acme_eab.sh 9
+acme_keychange.sh 3
+acme_lifecycle.sh 20
+acme_orders.sh 6
+acme_perca.sh 10
+acme_preauth_alpn.sh 12
+acme_reconnect.sh 7
+acme_resolver_forms.sh 13
+acme_retry_after.sh 4
+acme_sweep.sh 6
+acme_wildcard.sh 6
+ad_template_import.sh 7
+arch_model.sh 5
+audit_forward.sh 11
+audit.sh 8
+auth_backend_shipped.sh 6
+auth_db_only.sh 2
+backup_encrypted.sh 4
+backup.sh 3
+baseline.sh 4
+bench_smoke.sh 5
+bootstrap_seed.sh 4
+build_image_gated.sh 
+ca_ancestors.sh 4
+ca_create_hsm.sh 4
+ca_delete.sh 3
+ca_keys_token_only.sh 3
+ca_kind_selfsigned.sh 2
+ca_no_fk.sh 3
+ca_pick_tiebreak.sh 2
+ca_rekey_carries_ca_identity.sh 5
+ca_rekey.sh 5
+ca_rollover_chain.sh 7
+ca_rollover_query.sh 2
+cert_profiles.sh 9
+certgen_pin_always.sh 1
+certs_ca_columns.sh 3
+certs_role_dropped.sh 2
+chain_rekeyed_ca.sh 3
+cli_help.sh 
+client_config_store.sh 3
+cmp_auth.sh 4
+cmp_authz.sh 4
+cmp_certconf.sh 4
+cmp_client_ca_db.sh 20
+cmp_concurrent.sh 3
+cmp_extracerts.sh 25
+cmp_matrix.sh 4
+cmp_onhold.sh 4
+cmp_perca.sh 4
+cmp_peruser.sh 5
+cmp_ra_cert_id.sh 10
+cmp_ra_chain.sh 3
+cmp_ra.sh 3
+cmp_response_digest.sh 4
+cmp_rfc9810.sh 4
+concurrent_enrol.sh 6
+config_bootstrap_keys.sh 3
+config_file_editor.sh 8
+config_keys_live.sh 1
+config_malformed_row.sh 3
+config_overlay_ordering.sh 12
+config_ui_modifiable.sh 5
+config_value_hash.sh 5
+console_xss.sh 2
+crl_cache.sh 7
+crl_delta.sh 3
+crl.sh 3
+cross_sign_foreign.sh 3
+db_restore_online.sh 1
+db_restore.sh 3
+default_admin_reset.sh 5
+demo_acme_override.sh 1
+demo_bench_webroot.sh 
+demo_functions_toplevel.sh 5
+demo_help.sh 1
+demo_scripts.sh 5
+demo_target_descriptor.sh 1
+demo_vars_have_writers.sh 
+deploy_defaults_exist.sh 4
+deploy_env.sh 8
+deploy_selfsigned_tls.sh 6
+directory_group_refresh.sh 17
+discover.sh 4
+docs_accurate.sh 1
+domains_db_only.sh 4
+endpoint_disable.sh 34
+endpoint_health.sh 3
+endpoints_advertised.sh 3
+endpoints.sh 5
+enrol_permissions.sh 8
+enrolment_credentials.sh 4
+env_honest.sh 
+est_cert_cap.sh 4
+est_csrattrs.sh 5
+est_dbauth.sh 15
+est_matrix.sh 11
+est_mtls_role.sh 7
+est_perca.sh 6
+est_serverkeygen.sh 4
+ha_failover.sh 7
+hsm_sidecar.sh 3
+identity_union_guard.sh 2
+imported_crl.sh 2
+install_protocol_choice.sh 1
+install_wizard.sh 1
+inventory_filters.sh 3
+ldap.sh 10
+leaf_hash_choice.sh 5
+login_throttle.sh 38
+mcp.sh 2
+mesh_listener_cert_id.sh 11
+mesh_publication_complete.sh 1
+mesh_tls.sh 
+mesh_trigger_columns.sh 3
+mesh_verify.sh 2
+mesh.sh 
+ms_kerberos.sh 19
+ms_perca.sh 5
+ms_smoke.sh 5
+ms_template_policy.sh 5
+ms_templates.sh 5
+ms_xcep_cas.sh 5
+ms_xcep_guid.sh 5
+ms_xcep_unsigned.sh 2
+ms_xxe.sh 4
+native_deploy.sh 1
+no_default_ca.sh 1
+no_insecure_settings.sh 3
+no_loose_secrets.sh 4
+no_sticky_sessions.sh 3
+notify_web.sh 5
+notify.sh 8
+ocsp_abuse.sh 22
+ocsp_expiry_sweep.sh 16
+ocsp_perca.sh 4
+ocsp_rekeyed_chain.sh 3
+ocsp_responder_keys.sh 6
+ocsp_responder.sh 4
+oidc.sh 12
+p11kit_patch.sh 3
+pg_cleanup_scope.sh 2
+pg_helpers_no_block.sh 5
+pg_no_leak.sh 1
+pg_priv_census.sh 3
+pg_priv_no_source_side_effects.sh 13
+pg_reconnect.sh 6
+pg_role_check.sh 1
+pg_smoke.sh 4
+pg_store_hash_selectors.sh 4
+pg_store_hash.sh 3
+pg_store_uri.sh 3
+pg_tls_issue.sh 4
+pkcs11.sh 5
+pqc.sh 2
+profile_assign.sh 4
+profile_ca_ku.sh 3
+profile_choice.sh 3
+profile_custom_exts.sh 4
+profile_passthrough_exts.sh 3
+profiles_web.sh 4
+pss_loaded_key_signing.sh 6
+public_repo_hygiene.sh 4
+replication_stream.sh 128
+replication.sh 4
+roles_permissions_schema.sh 3
+rolling_update_aux.sh 4
+saml_oidc_providers.sh 5
+saml.sh 5
+scep_challenge_type.sh 2
+scep_perca.sh 4
+scep_renewal.sh 4
+scep.sh 18
+schema_apply_psql_argv.sh 
+schema_step_transactions.sh 
+schema_steps_immutable.sh 
+schema_version.sh 4
+sda.sh 3
+secret_leak.sh 5
+selfservice_subject_profile.sh 3
+serial_canonical_form.sh 4
+service_cert_renew.sh 3
+session_cookie_secure.sh 6
+setup_wizard.sh 4
+signing_digest.sh 2
+smoke_cmp.sh 2
+smoke_est.sh 3
+smoke_ocsp.sh 3
+smoke_store.sh 3
+sso_provider_fixes.sh 17
+store_abuse.sh 2
+store_crl.sh 3
+store_hash.sh 4
+store_uri.sh 4
+suite_exit_honest.sh 19
+tls_key_matrix.sh 13
+token_key_liveness.sh 86
+transport_cert_id_scope.sh 4
+transport_cert_stable.sh 4
+trap_cleanup.sh 3
+update.sh 3
+user_computer_kind.sh 4
+version_flag.sh 1
+web_backup.sh 4
+web_ca_create.sh 6
+web_ca_csr.sh 5
+web_ca_hsm.sh 4
+web_ca_import.sh 3
+web_ca_urls.sh 4
+web_cas.sh 6
+web_config_pending_restart.sh 35
+web_cross_sign.sh 3
+web_csrmap.sh 8
+web_directories.sh 4
+web_discover.sh 3
+web_endpoint_controls.sh 5
+web_first_admin_role.sh 2
+web_hardening.sh 3
+web_hsm_leaf.sh 15
+web_hsm_perms.sh 4
+web_issue.sh 6
+web_keygen_der.sh 3
+web_keygen.sh 3
+web_master_role.sh 3
+web_mtls.sh 4
+web_onboarding.sh 6
+web_openmode.sh 2
+web_p12.sh 2
+web_pkcs11_slots.sh 5
+web_role_editor.sh 5
+web_scoped_roles.sh 3
+web_self_manage_users.sh 3
+web_selfservice.sh 3
+web_sessions_persist.sh 6
+web_signing_ca.sh 4
+web_subject_pages.sh 4
+web_subject_roles_api.sh 3
+web_templates.sh 3
+web_users_ui.sh 3
+web_users.sh 3
+web.sh 6

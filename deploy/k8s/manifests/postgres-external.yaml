@@ -1,0 +1,49 @@
+# The mesh interconnect: ONE server's Postgres, reachable by the PEER clusters. apply.sh renders
+# this once per server, with NODE_ORDINAL set.
+#
+# The headless `fastpki-node` Service resolves inside this cluster and nowhere else. That is correct
+# for every in-cluster client and useless for a mesh, where a peer in ANOTHER cluster opens a
+# replication connection to this database. compose solves it with PG_BIND publishing 5432 on the
+# host's interconnect address; this is that, in Kubernetes.
+#
+# Applied whenever PG_EXTERNAL_TYPE is not "none". apply.sh refuses to deploy a multi-data-center
+# cluster without an interconnect address per server, rather than bringing up something that can
+# never be meshed.
+#
+# ⚠️ THIS PORT MUST NOT FACE THE PUBLIC INTERNET. The replication stream carries web_users PBKDF2
+# password hashes, the per-user CMP/ACME/SCEP enrolment secrets in `keys`, and every peer's
+# database password travels in the conninfo that opens it. Peer the clusters privately — a VPC
+# peering, a private LB, a VPN — and restrict it further with loadBalancerSourceRanges or a
+# NetworkPolicy. TLS is not optional here either: the topology conninfo uses sslmode=verify-full.
+#
+# ⚠️ EACH ON ITS OWN PORT: 5432 + the server's ordinal (apply.sh sets PG_EXTERNAL_PORT). A load
+# balancer that publishes on the machines' own addresses claims the port on every machine, so two
+# Services on 5432 cannot both be published.
+#
+# ⚠️ ONE SERVICE PER SERVER, SELECTED BY POD NAME — NOT ONE ACROSS BOTH. A standby serves reads
+# and cannot accept a replication slot, so a Service spreading connections over both servers
+# hands a peer's subscription to the standby half the time: it connects and never advances, which
+# reports healthy while nothing crosses between data centers. And which server is the primary
+# changes at a promotion, so no fixed selector can name it. The peers list every server's address
+# with target_session_attrs=read-write instead, exactly as they list both hosts of a Compose pair.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-external-$NODE_ORDINAL
+  labels:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: postgres-interconnect
+  annotations:
+    fastpki.io/datacenter: "$DC_INDEX"
+spec:
+  type: $PG_EXTERNAL_TYPE
+  selector:
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: node
+    statefulset.kubernetes.io/pod-name: fastpki-node-$NODE_ORDINAL
+  ports:
+    - name: postgres
+      port: $PG_EXTERNAL_PORT
+      targetPort: 5432
+      $PG_NODEPORT_BLOCK

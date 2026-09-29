@@ -1,0 +1,369 @@
+diff --git a/src/kmgmt/common.c b/src/kmgmt/common.c
+index 4d9c579..34a6286 100644
+--- a/src/kmgmt/common.c
++++ b/src/kmgmt/common.c
+@@ -264,6 +264,15 @@ int p11prov_kmgmt_gen(struct key_generator *ctx, CK_ATTRIBUTE *pubkey_template,
+         privtsize++;
+     }
+ 
++#ifndef NDEBUG
++    fprintf(stderr, "P11P-DEBUG kmgmt_gen: before GenerateKeyPair, privtsize=%d pubtsize=%d\n", privtsize, pubtsize);
++#endif
++#ifndef NDEBUG
++    for (int __d = 0; __d < privtsize; ++__d) fprintf(stderr, "P11P-DEBUG kmgmt_gen priv[%d]: type=0x%lx ulValueLen=%lu pValue=%p\n", __d, (unsigned long)privkey_template[__d].type, (unsigned long)privkey_template[__d].ulValueLen, (void*)privkey_template[__d].pValue);
++#endif
++#ifndef NDEBUG
++    for (int __d = 0; __d < pubtsize; ++__d) fprintf(stderr, "P11P-DEBUG kmgmt_gen pub[%d]: type=0x%lx ulValueLen=%lu\n", __d, (unsigned long)pubkey_template[__d].type, (unsigned long)pubkey_template[__d].ulValueLen);
++#endif
+     ret = p11prov_GenerateKeyPair(ctx->provctx, sh, &ctx->mechanism,
+                                   pubkey_template, pubtsize, privkey_template,
+                                   privtsize, &pubkey, &privkey);
+diff --git a/src/kmgmt/rsa.c b/src/kmgmt/rsa.c
+index feb344b..af94436 100644
+--- a/src/kmgmt/rsa.c
++++ b/src/kmgmt/rsa.c
+@@ -12,6 +12,7 @@ DISPATCH_KEYMGMT_FN(rsa, gen_settable_params);
+ DISPATCH_KEYMGMT_FN(rsa, gen_set_params);
+ DISPATCH_KEYMGMT_FN(rsa, gen);
+ DISPATCH_KEYMGMT_FN(rsa, load);
++DISPATCH_KEYMGMT_FN(rsapss, load);
+ DISPATCH_KEYMGMT_FN(rsa, match);
+ DISPATCH_KEYMGMT_FN(rsa, import);
+ DISPATCH_KEYMGMT_FN(rsa, import_types);
+@@ -205,6 +206,13 @@ static int p11prov_rsa_gen_internal(void *genctx, OSSL_CALLBACK *cb_fn,
+         privtsize++;
+     }
+ 
++#ifndef NDEBUG
++    fprintf(stderr, "P11P-DEBUG gen_internal: add_allow_mechs=%d privtsize=%d allowed_types=%p allowed_types_size=%lu\n",
++        (int)add_allow_mechs, privtsize, (void*)ctx->data.rsa.allowed_types, (unsigned long)ctx->data.rsa.allowed_types_size);
++#endif
++#ifndef NDEBUG
++    for (int __di = 0; __di < privtsize; ++__di) fprintf(stderr, "P11P-DEBUG gen_internal tmpl[%d]: type=0x%lx ulValueLen=%lu pValue=%p\n", __di, (unsigned long)privkey_template[__di].type, (unsigned long)privkey_template[__di].ulValueLen, (void*)privkey_template[__di].pValue);
++#endif
+     P11PROV_debug("rsa gen %p %p %p", genctx, cb_fn, cb_arg);
+ 
+     return p11prov_kmgmt_gen(ctx, pubkey_template, privkey_template, pubtsize,
+@@ -230,6 +238,17 @@ static void *p11prov_rsa_load(const void *reference, size_t reference_sz)
+     return p11prov_kmgmt_load(reference, reference_sz, CKK_RSA);
+ }
+ 
++static void *p11prov_rsapss_load(const void *reference, size_t reference_sz)
++{
++    P11PROV_OBJ *obj = p11prov_kmgmt_load(reference, reference_sz, CKK_RSA);
++    if (!obj) return NULL;
++    if (!p11prov_obj_is_rsa_pss(obj)) {
++        p11prov_obj_free(obj);
++        return NULL;
++    }
++    return obj;
++}
++
+ static int p11prov_rsa_match(const void *keydata1, const void *keydata2,
+                              int selection)
+ {
+@@ -490,6 +509,10 @@ static void *p11prov_rsapss_gen(void *genctx, OSSL_CALLBACK *cb_fn,
+             }
+         }
+ 
++#ifndef NDEBUG
++        fprintf(stderr, "P11P-DEBUG rsapss_gen: allowed_types=%p allowed_types_size=%lu token_supports=%d\n",
++            (void*)ctx->data.rsa.allowed_types, (unsigned long)ctx->data.rsa.allowed_types_size, (int)token_supports_allowed_mechs);
++#endif
+         ret = p11prov_rsa_gen_internal(genctx, cb_fn, cb_arg, &key, true);
+         switch (ret) {
+         case CKR_OK:
+@@ -634,7 +657,7 @@ const OSSL_DISPATCH p11prov_rsapss_keymgmt_functions[] = {
+     DISPATCH_KEYMGMT_ELEM(rsapss, GEN_SET_PARAMS, gen_set_params),
+     DISPATCH_KEYMGMT_ELEM(rsapss, GEN_SETTABLE_PARAMS, gen_settable_params),
+     DISPATCH_KEYMGMT_ELEM(rsa, GEN_CLEANUP, gen_cleanup),
+-    DISPATCH_KEYMGMT_ELEM(rsa, LOAD, load),
++    DISPATCH_KEYMGMT_ELEM(rsapss, LOAD, load),
+     DISPATCH_KEYMGMT_ELEM(kmgmt, FREE, free),
+     DISPATCH_KEYMGMT_ELEM(kmgmt, HAS, has),
+     DISPATCH_KEYMGMT_ELEM(rsa, MATCH, match),
+diff --git a/src/obj/keymgmt.c b/src/obj/keymgmt.c
+index da74163..e4a7f46 100644
+--- a/src/obj/keymgmt.c
++++ b/src/obj/keymgmt.c
+@@ -3,17 +3,98 @@
+ 
+ #include "obj/internal.h"
+ 
++/* Fetch CKA_ALLOWED_MECHANISMS from the token when it is not already cached
++ * on the object, and cache the result.  Returns a pointer to the cached
++ * attribute on success, NULL if the attribute is absent or unsupported. */
++static CK_ATTRIBUTE *get_or_fetch_allowed_mechs(P11PROV_OBJ *obj)
++{
++    CK_ATTRIBUTE *am;
++
++    am = p11prov_obj_get_attr(obj, CKA_ALLOWED_MECHANISMS);
++        #ifndef NDEBUG
++        fprintf(stderr, "P11P-DEBUG get_or_fetch: obj=%p class=%lu\n", (void*)obj, (unsigned long)obj->class);
++        #endif
++    if (am && am->ulValueLen > 0) return am;
++        #ifndef NDEBUG
++        fprintf(stderr, "P11P-DEBUG cached am=%p len=%lu\n", (void*)am, am ? (unsigned long)am->ulValueLen : 0);
++        #endif
++
++    /* The RSA-PSS keygen sets CKA_ALLOWED_MECHANISMS on the private key but
++     * SoftHSM does not mirror it to the public key.  So the attribute lives
++     * only on the private object.  When obj itself is a private key, read
++     * from it directly; only cross to its private-key pair when obj is a
++     * public key that needs its companion. */
++    P11PROV_OBJ *pub = obj;
++    P11PROV_OBJ *free_me = NULL;
++    if (obj->class == CKO_PUBLIC_KEY) {
++        pub = p11prov_obj_find_associated(obj, CKO_PRIVATE_KEY);
++        if (!pub) return NULL;
++        free_me = pub;
++    }
++    if (pub->class != CKO_PUBLIC_KEY && pub->class != CKO_PRIVATE_KEY) {
++        if (free_me) p11prov_obj_free(free_me);
++        return NULL;
++    }
++
++    CK_OBJECT_HANDLE h = p11prov_obj_get_handle(pub);
++    if (h == CK_INVALID_HANDLE) {
++        if (free_me) p11prov_obj_free(free_me);
++        return NULL;
++    }
++
++    P11PROV_SESSION *session = NULL;
++    CK_RV ret = p11prov_try_session_ref(pub, 0,
++        pub->class == CKO_PRIVATE_KEY ? true : false, false, &session);
++    if (ret != CKR_OK) {
++        if (free_me) p11prov_obj_free(free_me);
++        return NULL;
++    }
++
++    CK_SESSION_HANDLE sh = p11prov_session_handle(session);
++    CK_ATTRIBUTE attr = { CKA_ALLOWED_MECHANISMS, NULL, 0 };
++    p11prov_set_error_mark(pub->ctx);
++    ret = p11prov_GetAttributeValue(pub->ctx, sh, h, &attr, 1);
++    #ifndef NDEBUG
++    fprintf(stderr, "P11P-DEBUG GetAttr ret=%lu len=%lu\n", (unsigned long)ret, (unsigned long)attr.ulValueLen, (unsigned long)pub->class);
++    #endif
++    if ((ret == CKR_OK || ret == CKR_ATTRIBUTE_TYPE_INVALID)
++        && attr.ulValueLen > 0
++        && attr.ulValueLen != CK_UNAVAILABLE_INFORMATION) {
++        attr.pValue = OPENSSL_malloc(attr.ulValueLen);
++        if (attr.pValue) {
++            ret = p11prov_GetAttributeValue(pub->ctx, sh, h, &attr, 1);
++    #ifndef NDEBUG
++    fprintf(stderr, "P11P-DEBUG GetAttr ret=%lu len=%lu\n", (unsigned long)ret, (unsigned long)attr.ulValueLen, (unsigned long)pub->class);
++    #endif
++            if (ret == CKR_OK) {
++                p11prov_obj_add_attr(obj, &attr);
++                attr.pValue = NULL;
++                p11prov_pop_error_to_mark(pub->ctx);
++                p11prov_return_session(session);
++                if (free_me) p11prov_obj_free(free_me);
++                am = p11prov_obj_get_attr(obj, CKA_ALLOWED_MECHANISMS);
++        #ifndef NDEBUG
++        fprintf(stderr, "P11P-DEBUG get_or_fetch: obj=%p class=%lu\n", (void*)obj, (unsigned long)obj->class);
++        #endif
++                return (am && am->ulValueLen > 0) ? am : NULL;
++            }
++            OPENSSL_free(attr.pValue);
++        }
++    }
++    p11prov_clear_last_error_mark(pub->ctx);
++    p11prov_return_session(session);
++    if (free_me) p11prov_obj_free(free_me);
++    return NULL;
++}
++
+ bool p11prov_obj_is_rsa_pss(P11PROV_OBJ *obj)
+ {
+     CK_BBOOL token_supports_allowed_mechs = CK_TRUE;
+     CK_ATTRIBUTE *am = NULL;
+     CK_MECHANISM_TYPE *allowed;
+-    P11PROV_OBJ *priv = NULL;
+     int am_nmechs;
+     CK_RV ret;
+ 
+-    /* If the token does not support this attribute, do not even try to figure
+-     * out the subtype. */
+     ret = p11prov_token_sup_attr(obj->ctx, obj->slotid, GET_ATTR,
+                                  CKA_ALLOWED_MECHANISMS,
+                                  &token_supports_allowed_mechs);
+@@ -23,31 +104,11 @@ bool p11prov_obj_is_rsa_pss(P11PROV_OBJ *obj)
+         return false;
+     }
+ 
+-    am = p11prov_obj_get_attr(obj, CKA_ALLOWED_MECHANISMS);
+-    if (am == NULL || am->ulValueLen == 0) {
+-        /* The ALLOWED_MECHANISMS should be on both of the keys. But more
+-         * commonly they are available only on the private key. Check if we
+-         * have a priv key associated to this pub key and if so, use that one.
+-         * TODO we can try also certificate restrictions
+-         */
+-        if (obj->class == CKO_PRIVATE_KEY) {
+-            /* no limitations */
+-            return false;
+-        }
+-
+-        /* Try to find private key */
+-        priv = p11prov_obj_find_associated(obj, CKO_PRIVATE_KEY);
+-        if (priv == NULL) {
+-            return false;
+-        }
+-
+-        am = p11prov_obj_get_attr(priv, CKA_ALLOWED_MECHANISMS);
+-        if (am == NULL || am->ulValueLen == 0) {
+-            /* no limitations */
+-            p11prov_obj_free(priv);
+-            return false;
+-        }
++    am = get_or_fetch_allowed_mechs(obj);
++    if (!am || am->ulValueLen == 0) {
++        return false;
+     }
++
+     allowed = (CK_MECHANISM_TYPE *)am->pValue;
+     am_nmechs = am->ulValueLen / sizeof(CK_MECHANISM_TYPE);
+     for (int i = 0; i < am_nmechs; i++) {
+@@ -59,14 +120,9 @@ bool p11prov_obj_is_rsa_pss(P11PROV_OBJ *obj)
+             }
+         }
+         if (!found) {
+-            /* this is not a RSA-PSS mechanism. We can not enforce any
+-             * limitations */
+-            p11prov_obj_free(priv);
+             return false;
+         }
+     }
+-    /* all allowed mechanisms fit into the list of RSA-PSS ones */
+-    p11prov_obj_free(priv);
+     return true;
+ }
+ 
+@@ -1061,3 +1117,5 @@ P11PROV_OBJ *p11prov_obj_pub_from_priv(P11PROV_OBJ *priv)
+ 
+     return key;
+ }
++
++#include <stdio.h>
+diff --git a/src/sig/internal.h b/src/sig/internal.h
+index 6e7d93c..b8fb33e 100644
+--- a/src/sig/internal.h
++++ b/src/sig/internal.h
+@@ -78,6 +78,7 @@ int p11prov_sig_digest_update(P11PROV_SIG_CTX *sigctx, unsigned char *data,
+                               size_t datalen);
+ int p11prov_sig_digest_final(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
+                              size_t *siglen, size_t sigsize);
++CK_RV p11prov_rsasig_set_mechanism(P11PROV_SIG_CTX *sigctx);
+ 
+ #define DER_SEQUENCE 0x30
+ #define DER_OBJECT 0x06
+diff --git a/src/sig/rsasig.c b/src/sig/rsasig.c
+index 1fd0c1d..35ef649 100644
+--- a/src/sig/rsasig.c
++++ b/src/sig/rsasig.c
+@@ -408,7 +408,7 @@ DISPATCH_RSASIG_FN(set_ctx_params);
+ DISPATCH_RSASIG_FN(gettable_ctx_params);
+ DISPATCH_RSASIG_FN(settable_ctx_params);
+ 
+-static CK_RV p11prov_rsasig_set_mechanism(P11PROV_SIG_CTX *sigctx)
++CK_RV p11prov_rsasig_set_mechanism(P11PROV_SIG_CTX *sigctx)
+ {
+     const struct rsasig_data *data = NULL;
+     int rv;
+@@ -559,6 +559,7 @@ static void *p11prov_rsasig_newctx(void *provctx, const char *properties)
+ static int p11prov_rsasig_sign_init(void *ctx, void *provkey,
+                                     const OSSL_PARAM params[])
+ {
++    P11PROV_SIG_CTX *sigctx = (P11PROV_SIG_CTX *)ctx;
+     CK_RV ret;
+ 
+     P11PROV_debug("rsa sign init (ctx=%p, key=%p, params=%p)", ctx, provkey,
+@@ -569,6 +570,16 @@ static int p11prov_rsasig_sign_init(void *ctx, void *provkey,
+         return RET_OSSL_ERR;
+     }
+ 
++    /* When the caller does not explicitly request a padding mode and the key
++     * is PSS-restricted (CKA_ALLOWED_MECHANISMS lists only PSS algorithms),
++     * default to PSS so the token does not reject CKM_RSA_PKCS.  The store
++     * and encoder paths already detect this via p11prov_obj_is_rsa_pss();
++     * the signature path did not. */
++    if (!OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)
++        && p11prov_obj_is_rsa_pss(sigctx->key)) {
++        sigctx->mechtype = CKM_RSA_PKCS_PSS;
++    }
++
+     return p11prov_rsasig_set_ctx_params(ctx, params);
+ }
+ 
+@@ -603,6 +614,7 @@ static int p11prov_rsasig_sign(void *ctx, unsigned char *sig, size_t *siglen,
+ static int p11prov_rsasig_verify_init(void *ctx, void *provkey,
+                                       const OSSL_PARAM params[])
+ {
++    P11PROV_SIG_CTX *sigctx = (P11PROV_SIG_CTX *)ctx;
+     CK_RV ret;
+ 
+     P11PROV_debug("rsa verify init (ctx=%p, key=%p, params=%p)", ctx, provkey,
+@@ -613,6 +625,11 @@ static int p11prov_rsasig_verify_init(void *ctx, void *provkey,
+         return RET_OSSL_ERR;
+     }
+ 
++    if (!OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)
++        && p11prov_obj_is_rsa_pss(sigctx->key)) {
++        sigctx->mechtype = CKM_RSA_PKCS_PSS;
++    }
++
+     return p11prov_rsasig_set_ctx_params(ctx, params);
+ }
+ 
+@@ -655,6 +672,11 @@ static int p11prov_rsasig_digest_sign_init(void *ctx, const char *digest,
+ 
+     sigctx->digest_op = true;
+ 
++    if (!OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)
++        && p11prov_obj_is_rsa_pss(sigctx->key)) {
++        sigctx->mechtype = CKM_RSA_PKCS_PSS;
++    }
++
+     return p11prov_rsasig_set_ctx_params(ctx, params);
+ }
+ 
+diff --git a/src/sig/signature.c b/src/sig/signature.c
+index 84e3c51..2d59276 100644
+--- a/src/sig/signature.c
++++ b/src/sig/signature.c
+@@ -430,6 +430,35 @@ static CK_RV p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
+             ret = p11prov_VerifyInit(sigctx->provctx, sess, &sigctx->mechanism,
+                                      handle);
+         }
++        // If the key rejects PKCS1v1.5, retry with PSS when the key's
++        // CKA_ALLOWED_MECHANISMS restricts it to PSS-only — the token's
++        // refusal is the only reliable signal.
++        if (ret != CKR_OK && sigctx->mechtype == CKM_RSA_PKCS) {
++            sigctx->mechtype = CKM_RSA_PKCS_PSS;
++            p11prov_rsasig_set_mechanism(sigctx);
++            p11prov_return_session(session);
++            session = NULL;
++            ret = p11prov_try_session_ref(sigctx->key,
++                                          sigctx->mechanism.mechanism,
++                                          reqlogin, false, &session);
++            if (ret == CKR_OK) {
++                sess = p11prov_session_handle(session);
++                if (sigctx->operation == CKF_SIGN) {
++                    ret = p11prov_SignInit(sigctx->provctx, sess,
++                                           &sigctx->mechanism, handle);
++                } else if (sigctx->signature) {
++                    ret = p11prov_VerifySignatureInit(
++                        sigctx->provctx, sess, &sigctx->mechanism, handle,
++                        sigctx->signature, sigctx->signature_len);
++                    if (ret == CKR_OK) {
++                        sigctx->verify_signature = true;
++                    }
++                } else {
++                    ret = p11prov_VerifyInit(sigctx->provctx, sess,
++                                             &sigctx->mechanism, handle);
++                }
++            }
++        }
+         if (ret == CKR_OK) {
+             sigctx->session_state = SESS_INITIALIZED;
+         }

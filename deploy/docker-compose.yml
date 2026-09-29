@@ -1,0 +1,859 @@
+# FastPKI — full stack: Postgres + one container per protocol + the web console.
+# See docs/deployment.md. Usage:
+#   docker compose build
+#   docker compose run --rm certgen          # one-time: self-signed transport cert
+#   docker compose up -d postgres            # (starts with TLS using that cert)
+#   docker compose run --rm bootstrap        # one-time: dirs + default admin/admin
+#                                            #   (must be changed at first login)
+#   docker compose up -d
+#
+# certgen MUST run before postgres: the app<->DB link and the console are TLS from
+# first boot using a self-signed cert generated at deploy time (there is no CA yet,
+# See deploy/certgen.sh. That cert is still a DEV/TEST default; the
+# admin/admin login is now forced to change at first sign-in.
+#
+# All FastPKI services share the image, the config (deploy/bootstrap.compose.conf) and
+# the /var/pki volume (CA keys, TLS certs, users). Edit bootstrap.compose.conf
+# for your hostname/policy before bootstrapping.
+name: fastpki
+
+x-fastpki: &fastpki
+  # Build node leaves this default (build from source). Nodes that pull a
+  # prebuilt image from a registry set FASTPKI_IMAGE=<registry>/fastpki:<tag>.
+  image: ${FASTPKI_IMAGE:-fastpki:local}
+  build:
+    context: ..                         # the Dockerfile lives at the repo root
+  restart: unless-stopped
+  # Per-node / per-deployment overrides. deploy/.env is untracked and
+  # differs per node; its values are injected into the container's environment,
+  # where the config loader (Config::from_env) picks up any key NOT set in the
+  # universal, git-tracked bootstrap.compose.conf — e.g. this node's DATACENTER_ID (the
+  # serial PREFIX it resolves to lives in the `datacenters` table, not here) and
+  # CMP_CLIENT_CA. Optional: a single-node deployment needs no .env (full-width
+  # random serials, no client CA). See deploy/.env.example.
+  env_file:
+    - path: .env
+      required: false
+  # Every app reaches the token through the `token` container's socket.
+  # PKCS11_MODULE is the p11-kit client shim by default so a `pkcs11:` key ref works out
+  # of the box; override it with a real HSM's module in production and the code
+  # path is unchanged.
+  environment:
+    P11_KIT_SERVER_ADDRESS: unix:path=/run/p11/pkcs11.sock
+    XDG_RUNTIME_DIR: /run/p11
+    PKCS11_MODULE: ${PKCS11_MODULE:-/usr/lib/pkcs11/p11-kit-client.so}
+    ACME_DNS_RESOLVER: ${ACME_DNS_RESOLVER:-}
+    # Generated per deployment by install.sh into .env. Empty here keeps a hand-run
+    # `docker compose up` behaving exactly as before for someone who skipped the wizard —
+    # bootstrap.compose.conf's value then applies, and SCEP refuses enrolment if that is empty too.
+    # bootstrap.compose.conf is git-tracked, so it cannot carry a per-deployment
+    # password — it ships `password=fastpki`. A config key may also arrive as an
+    # environment variable of the same name, and the environment wins, so this is where
+    # the generated password reaches the apps. The literal fallback keeps a hand-run
+    # `docker compose up` working exactly as before for someone who skipped the wizard.
+    PG_CONNINFO: >-
+      host=postgres port=5432 dbname=fastpki user=fastpki
+      password=${POSTGRES_PASSWORD:-fastpki} sslmode=verify-full
+      sslrootcert=/var/pki/tls/pg/ca.crt target_session_attrs=read-write connect_timeout=5
+  # ⚠️ ACTIVE DIRECTORY IS FOUND BY NAME, AND DOCKER'S RESOLVER DOES NOT KNOW YOUR DOMAIN.
+  # A directory is configured as `ldap://dc.corp.example`, and every AD-facing feature — LDAP
+  # login, group and user import, MS certificate-template import, Kerberos/SPNEGO — resolves
+  # that name first. Docker's embedded resolver (127.0.0.11) answers for compose service
+  # names and forwards everything else to the HOST's resolver, which on a machine that is not
+  # domain-joined has never heard of the AD zone. The symptom is not a DNS error, it is
+  # `Can't contact LDAP server`, so it reads like a firewall or a credentials problem.
+  #
+  # Point these at the domain controller's DNS and the forward works. Both are unset by
+  # default and compose then OMITS the keys entirely, so a deployment with no directory
+  # behaves exactly as it did before.
+  #
+  # Use the DNS NAME, not an IP, in the directory's URI: an `ldaps://` certificate is issued
+  # to the DC's name, and Kerberos needs SRV records that only the AD DNS serves.
+  # ⚠️ ONE ADDRESS: interpolation yields one string, and Docker refuses "a,b" as a DNS
+  # address, so a comma-separated list fails every container create.
+  dns: ${DIRECTORY_DNS:-}
+  dns_search: ${DIRECTORY_DNS_SEARCH:-}
+  volumes:
+    - ./bootstrap.compose.conf:/app/config/bootstrap.conf:ro
+    - pki-data:/var/pki
+    - p11-socket:/run/p11
+  depends_on:
+    postgres:
+      condition: service_healthy
+    token:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # certgen provisions the transport TLS cert into the shared volume BEFORE postgres
+    # reads it at startup, so a bare `docker compose up -d` comes up encrypted with no
+    # manual step (a fresh deploy has no CA, so a self-signed transport cert). One-shot.
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+    # wal_level=logical enables the multi-data-center active-active logical
+    # replication of the public inventory (fastpki-mesh). It is
+    # harmless (negligible overhead) for a single-node deployment, and is a
+    # prerequisite for the mesh — without it CREATE SUBSCRIPTION cannot stream.
+    #
+    # max_slot_wal_keep_size CAPS what an unconsumed slot can pin. Once the
+    # standby holds SYNCED logical slots and sends hot_standby_feedback, a cut
+    # interconnect pins WAL *and* xmin on both nodes for the length of the partition —
+    # and tests/lab_replication_mesh.sh cuts it on purpose. An uncapped slot filling
+    # the disk is how the lab thin pool froze every VM and presented as a network
+    # outage. Past the cap a slot is INVALIDATED (wal_status='lost') rather than
+    # eating the volume; the pre-flight check in pg-promote.sh treats a lost slot as
+    # not-ready, which is the correct, visible outcome.
+    #
+    # ⚠️ synchronized_standby_slots is deliberately NOT a `-c` flag here. It names a
+    # physical slot that only exists once a standby has actually joined this node, and
+    # naming a slot that does not exist STALLS every logical walsender silently
+    # ("Logical replication is waiting on the standby associated with replication
+    # slot"). The standby sets it via ALTER SYSTEM on its primary when it starts, and
+    # pg-promote.sh clears it after a promote. Command-line
+    # flags outrank postgresql.auto.conf, so putting it here would make both of those
+    # ALTER SYSTEM calls silent no-ops.
+    # TLS is enabled when a transport cert exists (certgen ran); if it is absent the
+    # server still comes up (plaintext) so a bare bring-up isn't blocked. The outer
+    # entrypoint passes `sh` straight through; the inner `docker-entrypoint.sh postgres`
+    # does the normal init + gosu-to-postgres, so the server runs as uid 70.
+    # NB: $$ escapes compose's own variable interpolation so the SHELL (not compose)
+    # expands $SSL — a single $ makes compose blank it out ("SSL variable is not set")
+    # and the TLS flags silently never reach postgres.
+    #
+    # ── POSTGRES COPIES ITS CERTIFICATE IN, IT DOES NOT SERVE IT IN PLACE ───────────
+    #
+    # Postgres refuses a key file it does not own ("private key file has non-root/
+    # non-owner ownership"), so /pki/tls/pg used to be chowned 70:70 by certgen and
+    # re-chowned by bootstrap.sh. That works exactly as long as ROOT writes the file.
+    # The console does not: fastpki-web runs as the unprivileged `fastpki` user, and
+    # The agreed design has the console issue the certificate and
+    # write the pair into the shared volume. It cannot chown to 70, and if it could,
+    # /pki is mounted read-only here anyway.
+    #
+    # So this end owns the ownership problem. The shared volume is the DELIVERY point
+    # and is owned by `fastpki`; the copy under $TLS is what the server actually reads,
+    # owned 70:70 with the key at 0600. Nothing has to be root at the moment of writing.
+    #
+    # The copy also lets the certificate change without a restart: the watcher below
+    # re-copies on change and reloads. A SIGHUP re-runs secure_initialize(), which
+    # re-reads ssl_cert_file/ssl_key_file from disk, so a content-only change is picked
+    # up — the paths never move. Existing sessions keep the old certificate until they
+    # reconnect, which is the normal TLS-rotation behaviour, not a defect.
+    #
+    # ⚠️ $TLS is deliberately NOT inside $PGDATA. pg_basebackup copies the whole data
+    # directory, so a standby seeded from here would inherit the primary's copy and
+    # then fight its own sync over it.
+    command:
+      - sh
+      - -ec
+      - |
+        SRC=/pki/tls/pg
+        TLS=/var/lib/postgresql/tls
+        # Copies only when the source really differs, so the watcher below can use the
+        # return value as "something changed" and not reload every 30 seconds forever.
+        # Writes .new + mv so the server never reads a half-copied PEM.
+        sync_tls() {
+          [ -f "$$SRC/server.crt" ] && [ -f "$$SRC/server.key" ] || return 1
+          if [ -f "$$TLS/server.crt" ] && cmp -s "$$SRC/server.crt" "$$TLS/server.crt" \
+             && cmp -s "$$SRC/server.key" "$$TLS/server.key"; then return 1; fi
+          mkdir -p "$$TLS"
+          cp "$$SRC/server.crt" "$$TLS/server.crt.new" || return 1
+          cp "$$SRC/server.key" "$$TLS/server.key.new" || return 1
+          chown 70:70 "$$TLS/server.crt.new" "$$TLS/server.key.new"
+          chmod 644 "$$TLS/server.crt.new"
+          chmod 600 "$$TLS/server.key.new"
+          mv "$$TLS/server.crt.new" "$$TLS/server.crt"
+          mv "$$TLS/server.key.new" "$$TLS/server.key"
+          return 0
+        }
+        sync_tls || true
+        # ⚠️ FAIL CLOSED. Starting without TLS is not a degraded mode, it is a dead one: every app
+        # connects with sslmode=verify-full (PG_CONNINFO ships that way), so a plaintext server can
+        # serve NOBODY. Coming up anyway turned one clear init-container failure into eight
+        # unrelated pods crash-looping on "server does not support SSL, but SSL was required" — a
+        # symptom that names the database and points nowhere near the cause.
+        #
+        # ⚠️ AND IT CANNOT RECOVER BY ITSELF. `ssl` is supplied as a `-c` command-line option, which
+        # sits at PGC_S_ARGV — the highest precedence — so the certificate watcher's
+        # pg_reload_conf() cannot raise it later. A server that starts plaintext STAYS plaintext for
+        # the life of the process, even after certgen or `fastpki-ca pg-tls` writes a perfect pair.
+        # Refusing here is what makes the fix take effect on the restart that follows.
+        SSL=
+        if [ ! -f "$$TLS/server.key" ]; then
+          echo "postgres: FATAL - no $$SRC/server.key, so this server cannot serve TLS." >&2
+          echo "postgres: every app dials it with sslmode=verify-full, so starting would" >&2
+          echo "postgres: reject every connection. Run: docker compose run --rm certgen" >&2
+          exit 1
+        fi
+        SSL="-c ssl=on -c ssl_cert_file=$$TLS/server.crt -c ssl_key_file=$$TLS/server.key"
+        # Come back as a STANDBY of another node instead of initialising a new primary:
+        #     STANDBY_OF=<primary> docker compose up -d postgres
+        # This is how a node JOINS an existing deployment on another host, and how the old
+        # primary rejoins after a promotion swapped the roles. deploy/ha-join.sh is the
+        # supported way in — it installs the primary's trust anchor and writes STANDBY_OF.
+        #
+        # ⚠️ An empty PGDATA with STANDBY_OF unset means docker-entrypoint runs initdb +
+        # createdb.sql and this node comes up as its OWN read-write primary. Beside a real
+        # one, with applications connecting target_session_attrs=read-write, that is a
+        # split brain they are free to land on either side of.
+        #
+        # Unset — a node that IS the primary — leaves everything below unchanged.
+        if [ -n "$${STANDBY_OF:-}" ]; then
+          AS="$$(command -v gosu || command -v su-exec)"
+          # The PRIMARY's anchor, supplied out of band — never this node's own ca.crt,
+          # which certgen has just overwritten with a self-signed cert the primary was
+          # not issued by. Falls back to the local anchor so a node that already shares
+          # the primary's trust (a mesh member, or a same-host rebuild) still works.
+          ROOT="$${STANDBY_CA:-/pki/tls/pg/primary-ca.crt}"
+          [ -f "$$ROOT" ] || ROOT=/pki/tls/pg/ca.crt
+          [ -f "$$ROOT" ] || ROOT=/pki/tls/pg/server.crt
+          # ⚠️ ONE NAME FOR A STANDBY'S SLOT ON EVERY PATH: fastpki_ and this host's own PG_BIND,
+          # lowercased, each character outside a-z and 0-9 as _, at most 63 characters (the
+          # Postgres limit). deploy/ha-join.sh and deploy/k8s/start-postgres.sh derive it the same
+          # way, so a rebuilt standby reclaims its own slot and a second one never takes another's.
+          SLOT="$$(printf 'fastpki_%s' "$${PG_BIND:-}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '_' | cut -c1-63)"
+          SRCCONN="host=$$STANDBY_OF port=5432 user=fastpki dbname=fastpki sslmode=verify-full sslrootcert=$$ROOT"
+          MAJ="$$(postgres -V | sed 's/[^0-9]*\([0-9]*\).*/\1/')"
+          HAVE="$$(cat /var/lib/postgresql/data/PG_VERSION 2>/dev/null || echo none)"
+          if [ "$$HAVE" = none ]; then
+            echo "postgres: STANDBY_OF=$$STANDBY_OF — seeding from that node rather than initialising a new primary"
+            until pg_isready -h "$$STANDBY_OF" -p 5432 -U fastpki >/dev/null 2>&1; do sleep 2; done
+            $$AS postgres psql -d "$$SRCCONN" -v ON_ERROR_STOP=0 -tAc \
+              "SELECT pg_drop_replication_slot('$$SLOT') FROM pg_replication_slots
+                WHERE slot_name='$$SLOT' AND NOT active;" >/dev/null 2>&1 || true
+            rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true
+            chown 70:70 /var/lib/postgresql/data; chmod 700 /var/lib/postgresql/data
+            if ! $$AS postgres pg_basebackup -h "$$STANDBY_OF" -p 5432 -U fastpki \
+                 -D /var/lib/postgresql/data -Fp -Xs -R -P -C -S "$$SLOT" -d "$$SRCCONN"; then
+              # ⚠️ SAY WHICH ANCHOR WAS USED. "certificate verify failed" names the primary,
+              # so it reads as a problem at the far end; the actual cause is almost always
+              # that this node is verifying against its own self-signed certgen output.
+              echo "postgres: seeding from $$STANDBY_OF FAILED (trust anchor: $$ROOT)." >&2
+              echo "postgres: if that says 'certificate verify failed', this node does not have" >&2
+              echo "postgres: the primary's anchor. Run deploy/ha-join.sh on this host to install" >&2
+              echo "postgres: it, or set STANDBY_CA to a file that verifies $$STANDBY_OF." >&2
+              exit 1
+            fi
+            echo "postgres: seeded from $$STANDBY_OF; starting as a streaming standby (pg_basebackup -R wrote standby.signal)"
+          elif [ -f /var/lib/postgresql/data/standby.signal ]; then
+            # ⚠️ AN ALREADY-SEEDED STANDBY MUST JUST START, and refusing it here meant the
+            # cross-host standby could not survive a single restart: ha-join.sh leaves
+            # STANDBY_OF set in .env (it has to — a re-seed needs it), so every
+            # `docker compose restart`, daemon restart and host reboot came back into this
+            # branch, printed "refusing to start" and restart-looped forever. Measured on
+            # two lab hosts: seeding worked, and the node was dead the moment it bounced.
+            #
+            # standby.signal is exactly the distinction the comment below already draws.
+            # Its presence means pg_basebackup -R wrote a standby here and primary_conninfo
+            # will point at whoever the primary is; there is no timeline to diverge and
+            # nothing to decide. Falling through starts it as the standby it already is.
+            echo "postgres: already a standby (standby.signal present) — following $$STANDBY_OF, not re-seeding"
+          else
+            # Refuse rather than guess. A populated data directory with NO standby.signal
+            # is this node's own diverged timeline from when it was a primary, and quietly
+            # starting it as one is the split brain this option exists to prevent.
+            #
+            # ⚠️ AND REFUSING MEANS EXITING. This used to print the two lines below and then
+            # fall through to the exec at the end of this script, so the operator got a
+            # warning and a read-write primary anyway -- beside the real one, with
+            # target_session_attrs=read-write letting applications land on either. That is
+            # the precise harm the branch was written to prevent, and it was invisible to a
+            # test that only checked the data was unmodified: the data IS unmodified, it is
+            # the ROLE that is wrong.
+            #
+            # It is not caught by "did it come back as a standby?" either, because a dir
+            # already holding standby.signal comes back as a standby for its own reasons.
+            # The failing case is a dir with no signal file -- the old primary's timeline.
+            echo "postgres: STANDBY_OF=$$STANDBY_OF but the data directory is already PG$$MAJ — refusing to start."
+            echo "postgres: remove this node's data volume first if you meant to re-seed from $$STANDBY_OF,"
+            echo "postgres: or unset STANDBY_OF to start this node on the data it already has."
+            exit 1
+          fi
+        fi
+        # Adopt a certificate the console issued while we were running. 30s is the
+        # worst-case delay quoted back to the operator in the console's own success
+        # message; making it shorter buys nothing, and making it longer would leave the
+        # applications' new trust anchor ahead of what the database serves for longer.
+        (
+          until pg_isready -q -U fastpki -d fastpki; do sleep 2; done
+          while :; do
+            sleep 30
+            if sync_tls; then
+              if psql -U fastpki -d fastpki -c 'SELECT pg_reload_conf()' >/dev/null 2>&1; then
+                echo "postgres: adopted a new TLS certificate from $$SRC and reloaded"
+              else
+                echo "postgres: WARNING copied a new TLS certificate from $$SRC but could not reload —" \
+                     "it will be served after the next restart"
+              fi
+            fi
+          done
+        ) &
+        # ⚠️ THIS IS WHAT LETS A STANDBY ON ANOTHER HOST AUTHENTICATE AT ALL. Once we are
+        # up, idempotently allow a streaming standby to open a physical-replication
+        # connection (dbname=replication over TLS + scram password). ha-join.sh never
+        # touches pg_hba, so nothing else adds this rule and pg_basebackup from a joining
+        # host is simply refused. Separate from the mesh's logical-replication rules —
+        # different pg_hba database column — and harmless when no standby has joined.
+        # Backgrounded so it waits for the socket, then survives the exec below. Uniform
+        # for a fresh OR an already-initialised data dir.
+        (
+          until pg_isready -q -U fastpki -d fastpki; do sleep 1; done
+          HBA=/var/lib/postgresql/data/pg_hba.conf
+          if ! grep -q 'FASTPKI-HA-STANDBY' "$$HBA"; then
+            printf '# FASTPKI-HA-STANDBY: streaming standby\nhostssl replication fastpki all scram-sha-256\n' >> "$$HBA"
+            psql -U fastpki -d fastpki -c 'SELECT pg_reload_conf()' >/dev/null 2>&1
+            echo "postgres: enabled the replication pg_hba rule for a streaming standby"
+          fi
+        ) &
+        # ⚠️ NAME THE CLIENT ON EVERY LINE. postgres:17-alpine's default
+        # log_line_prefix is bare, so an auth FATAL prints neither the user nor the
+        # address it came from -- which is exactly why "password authentication failed
+        # for user \"pki\"" every 8-9 minutes could not be traced to anything. %u@%d %h
+        # adds user@database and the client host; %q suppresses them for background
+        # processes that have no session, so startup and checkpointer lines stay clean.
+        # ⚠️ A NODE RUNNING AS A STANDBY NEEDS SETTINGS THIS EXEC DID NOT HAVE, and the
+        # symptom is silence. PG17 synchronises a primary's logical (failover) slots only
+        # when sync_replication_slots AND hot_standby_feedback are on, primary_slot_name is
+        # set and primary_conninfo carries a real dbname. pg_basebackup -R writes the last
+        # two; these two were simply absent on this path, so a cross-host standby of a MESH
+        # member synchronised nothing at all — and promoting it takes that DC out of the
+        # mesh while everything keeps looking healthy. Measured on a working cross-host
+        # standby: sync_replication_slots=off, hot_standby_feedback=off, and pg-promote.sh
+        # refusing with "only 0 of 2 peer logical slots are synced".
+        SBY=
+        if [ -f /var/lib/postgresql/data/standby.signal ]; then
+          SBY="-c hot_standby=on -c sync_replication_slots=on -c hot_standby_feedback=on"
+          # And the other half, on the PRIMARY: hold its logical subscribers back until this
+          # standby has the WAL, or a peer can consume past a position this node never
+          # received and a promote hands that peer a slot ahead of the new primary's WAL end.
+          # Set from here because naming a slot that does not exist stalls every logical
+          # walsender, so only a standby that actually exists may name its own.
+          if [ -n "$${STANDBY_OF:-}" ]; then
+            (
+              PSLOT="$$(printf 'fastpki_%s' "$${PG_BIND:-}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '_' | cut -c1-63)"
+              PROOT="$${STANDBY_CA:-/pki/tls/pg/primary-ca.crt}"
+              [ -f "$$PROOT" ] || PROOT=/pki/tls/pg/ca.crt
+              PAS="$$(command -v gosu || command -v su-exec)"
+              PCONN="host=$$STANDBY_OF port=5432 user=fastpki dbname=fastpki sslmode=verify-full sslrootcert=$$PROOT"
+              until pg_isready -h "$$STANDBY_OF" -p 5432 -U fastpki >/dev/null 2>&1; do sleep 2; done
+              # ⚠️ TWO SEPARATE -c FLAGS: both statements in one -c is an implicit
+              # transaction and ALTER SYSTEM refuses to run inside one.
+              if $$PAS postgres psql -d "$$PCONN" -v ON_ERROR_STOP=1 \
+                     -c "ALTER SYSTEM SET synchronized_standby_slots = '$$PSLOT'" \
+                     -c "SELECT pg_reload_conf()" >/dev/null 2>&1; then
+                echo "postgres: $$STANDBY_OF now waits for slot $$PSLOT before confirming to peers"
+              else
+                echo "postgres: WARNING could not set synchronized_standby_slots on $$STANDBY_OF —" \
+                     "a peer can consume past what this standby has, so a promote may diverge"
+              fi
+            ) &
+          fi
+        fi
+        exec docker-entrypoint.sh postgres \
+          -c log_line_prefix='%m [%p] %q%u@%d %h ' \
+          -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 \
+          -c max_slot_wal_keep_size=8GB $$SSL $$SBY
+    environment:
+      # STANDBY_OF names the node this one seeds from and follows: a host joining an
+      # existing deployment, or the old primary rejoining after a promotion swapped the
+      # roles. Declaring it here is what makes `STANDBY_OF=<node> docker compose up -d
+      # postgres` reach the container at all — a shell variable that is not listed under
+      # `environment:` never gets in. Empty by default, and the startup block treats empty
+      # as "be a primary", so a node that IS the primary is unchanged. PGPASSWORD is what
+      # pg_basebackup and the walreceiver authenticate with.
+      STANDBY_OF: ${STANDBY_OF:-}
+      # This host's own address, which names the replication slot it holds on its primary.
+      PG_BIND: ${PG_BIND:-}
+      # ⚠️ A JOINING NODE CANNOT VERIFY THE PRIMARY WITH ITS OWN ANCHOR, which is what
+      # made STANDBY_OF unusable across hosts: certgen mints a SELF-SIGNED transport cert
+      # here and copies it over pg/ca.crt on every single `up` (cert_good() compares the
+      # two byte-for-byte, and a fresh host has no server.crt, so it always regenerates).
+      # Seeding then dials the primary with sslmode=verify-full against THIS host's
+      # anchor and dies with "SSL error: certificate verify failed" in a restart loop —
+      # measured on two lab hosts, and it says nothing about certificates being the cause.
+      #
+      # The primary's anchor has to arrive out of band, at a path certgen never writes.
+      # deploy/ha-join.sh puts it here; unset and absent, everything below is unchanged.
+      STANDBY_CA: ${STANDBY_CA:-}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-fastpki}
+      POSTGRES_USER: fastpki
+      # install.sh generates this and writes it to .env. The literal remains
+      # only for a hand-run `docker compose up` that skipped the wizard.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fastpki}
+      POSTGRES_DB: fastpki
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Load the FastPKI schema on first init:
+      - ../sql/createdb.sql:/docker-entrypoint-initdb.d/10-fastpki.sql:ro
+      # Read-only: the self-signed transport cert certgen wrote into the shared
+      # volume (server.key is owned 70:70 0600 so PG's permission check passes).
+      - pki-data:/pki:ro
+    # Publish 5432 so peer data centers can subscribe (fastpki-mesh). Defaults to
+    # host loopback — SAFE for single-node; a multi-DC node sets PG_BIND to its
+    # mesh IP (e.g. its NetBird address) so only peers on the mesh can reach it.
+    ports:
+      - "${PG_BIND:-127.0.0.1}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastpki -d fastpki"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+
+  # ⚠️ NAMED FOR WHAT IT PROVIDES, NOT HOW. Everything else in this file depends on one thing
+  # from it — that /run/p11/pkcs11.sock exists and is healthy. The bundled SoftHSM satisfies
+  # that here and a vendor PKCS#11 module is loaded directly instead, so naming the service
+  # `softhsm` would have tied every app's depends_on to one implementation.
+  #
+  # ⚠️ THIS SOCKET IS ALWAYS THIS DEPLOYMENT'S OWN TOKEN. There is no arrangement in which it
+  # reaches somebody else's. The `p11-tls` service below publishes THIS token to a peer so a
+  # CA private key can be replicated into that peer's token — it is not a way to borrow one.
+  # See docs/architecture.md §4-§6.
+  #
+  # SoftHSM out-of-process, part of the STANDARD deploy: private keys
+  # live in a token, never in files, so this has to be up before anything that signs.
+  # It holds the token and serves it over a Unix socket via `p11-kit server`; app
+  # containers dial that socket with p11-kit-client.so, so SoftHSM runs HERE and never
+  # re-enters an app's libcrypto (a re-entrant deadlock — the reason in-process
+  # SoftHSM is not an option).
+  #
+  # SoftHSM is the DEV/TEST provider. For production, point PKCS11_MODULE at the
+  # real HSM's module instead and drop this service — the application code is identical,
+  # it only ever sees a pkcs11: URI.
+  token:
+    <<: *fastpki
+    user: "0:0"                     # root: init the token + create the socket
+    depends_on: []                  # no DB dependency
+    # ⚠️ A CEILING ON PROCESSES, so a client that leaks sessions cannot take the host with
+    # it. p11-kit-server forks a p11-kit-remote per connection, ~1.4 MB each, and a caller
+    # that never closes one multiplies them: measured at 516 and 616 on the two nodes of a
+    # native deployment, which exhausted a 924 MB machine and got PostgreSQL OOM-killed.
+    # Past this ceiling a new session fails and the caller sees an error, rather than the
+    # machine stopping. The native path sets the same bound with rc_ulimit -u; see
+    # deploy/native/openrc/fastpki-token.initd for the arithmetic behind the number.
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/p11/pkcs11.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        SOCK=/run/p11/pkcs11.sock; TOK=/var/lib/softhsm/tokens
+        mkdir -p /run/p11 "$$TOK"
+        export SOFTHSM2_CONF=/run/p11/softhsm2.conf
+        printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$$TOK" > "$$SOFTHSM2_CONF"
+        if ! softhsm2-util --show-slots 2>/dev/null | grep -qi 'label:.*fastpki'; then
+          # ⚠️ NO WELL-KNOWN DEFAULTS, AND THE GUARD HAS TO BE HERE TOO. certgen refuses to
+          # run without FASTPKI_PIN — "refuses to fall back to a well-known value" — but this
+          # is where the token is actually CREATED, and it used to default to 1234. So a
+          # `docker compose up` without .env produced a token holding every CA private key
+          # under a PIN published in this file, with certgen's fail-closed guard intact and
+          # bypassed. The SO PIN matters just as much: its whole purpose is to RESET the user
+          # PIN, so 0000 handed the token to anyone who could reach it however strong
+          # FASTPKI_PIN was. It follows FASTPKI_PIN when unset, exactly as the OpenRC service
+          # already did — one secret, no published value.
+          if [ -z "$${FASTPKI_PIN:-}" ]; then
+            echo "token: FATAL - FASTPKI_PIN is not set." >&2
+            echo "token:   This token holds every CA private key, so it will not be created" >&2
+            echo "token:   under a default PIN. Run deploy/install.sh, or set FASTPKI_PIN" >&2
+            echo "token:   in deploy/.env." >&2
+            exit 1
+          fi
+          softhsm2-util --init-token --free --label fastpki --so-pin "$${HSM_SO_PIN:-$$FASTPKI_PIN}" --pin "$$FASTPKI_PIN"
+          echo "token: initialised token 'fastpki'"
+        fi
+        echo "token: serving the token on $$SOCK (connectable by the fastpki user)"
+        exec /usr/libexec/p11-kit/p11-kit-server -f -n "$$SOCK" -u fastpki --provider /usr/lib/softhsm/libsofthsm2.so "pkcs11:"
+    volumes:
+      - p11-socket:/run/p11
+      - softhsm-tokens:/var/lib/softhsm/tokens
+
+  # ── the token, over mTLS, for hosts that do not share the socket volume ─────────────
+  #
+  # p11-kit speaks neither TLS nor TCP: the client shim parses `unix:path=` and
+  # `vsock:cid=;port=` and links no bind/listen. So a token is reachable only by processes
+  # that can open one file on one host, and that is what pins a deployment to a node. The
+  # answer is a proxy pair, and this is the SERVER half — TLS on a port, forwarded into the
+  # same socket the apps already use.
+  #
+  # ⚠️ A SEPARATE SERVICE, NOT A SECOND PROCESS IN `token`. That container ends in
+  # `exec p11-kit-server`, so a background stunnel beside it would die unnoticed while the
+  # container stayed healthy — the token would look served and answer nothing.
+  #
+  # ⚠️ WHAT GOES OVER THIS LINK. C_Login carries the PIN protecting every CA private key in
+  # the token. On one host that PIN is a 0400 file that never crosses a machine boundary;
+  # here it is on the wire, and client-certificate verification is the only thing between
+  # the network and every CA. Hence verifyPeer AND verifyChain, and a CApath holding only
+  # the certificates certgen minted. checkHost/checkIP are deliberately absent: compose,
+  # k8s and cloud VMs all hand out dynamic names and addresses, so the identity is the
+  # pinned certificate rather than where it answers from.
+  #
+  # Opt-in twice over, so an existing deployment is untouched: the profile has to be in
+  # COMPOSE_PROFILES, and certgen only mints the material under P11_TLS=on.
+  p11-tls:
+    <<: *fastpki
+    profiles: ["p11tls"]
+    user: "0:0"
+    depends_on:
+      token:
+        condition: service_healthy
+    ports: ["${P11_TLS_PORT:-12345}:12345"]
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -lnt 2>/dev/null | grep -q ':12345' || ss -lnt 2>/dev/null | grep -q ':12345'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        D=/var/pki/tls/p11
+        if [ ! -f "$$D/server.crt" ]; then
+          echo "p11-tls: FATAL - $$D/server.crt is missing." >&2
+          echo "p11-tls:   Set P11_TLS=on in .env and re-run certgen:" >&2
+          echo "p11-tls:     docker compose run --rm certgen" >&2
+          exit 1
+        fi
+        # Trust set from the mesh, not from files carried between hosts: each node publishes
+        # its own certificate into its own `datacenters` row and this materialises them.
+        # Best-effort — a transient database outage must not take the token offline, so a
+        # failure keeps whatever is already on disk and says so.
+        # ⚠️ AND PUBLISH THE OTHER HALF. A peer verifies the host it dials, and it can
+        # only do that against a certificate this node has advertised — without this it
+        # would fall back to one it generated itself and no handshake could succeed.
+        fastpki-config --config /app/config/bootstrap.conf p11-server-publish "$$D/server.crt" || \
+          echo "p11-tls: WARNING - could not publish this node's server certificate; peers that have not already synced it cannot verify this host" >&2
+        fastpki-config --config /app/config/bootstrap.conf p11-clients-sync "$$D/clients" || \
+          echo "p11-tls: WARNING - could not refresh the trust directory; using what is on disk" >&2
+        # ⚠️ AND THE DIALLING HALF, AT START — NOT ONLY IN THE DAILY certrenew LOOP. Every
+        # node with P11_TLS on publishes its own token AND may dial a peer to replicate a CA
+        # key out of one. When this ran only daily, a freshly deployed node had an empty
+        # servers/ directory and `fastpki-ca key replicate --from` refused with "no peer
+        # token host can be verified" for up to a day, with nothing saying it was a matter
+        # of waiting.
+        mkdir -p "$$D/servers"
+        fastpki-config --config /app/config/bootstrap.conf p11-client-publish "$$D/client.crt" || \
+          echo "p11-tls: WARNING - could not publish this node's client certificate; peers cannot admit it until this succeeds" >&2
+        fastpki-config --config /app/config/bootstrap.conf p11-servers-sync "$$D/servers" || \
+          echo "p11-tls: WARNING - could not refresh $$D/servers; using what is on disk" >&2
+        openssl rehash "$$D/servers" >/dev/null 2>&1 || true
+        # ⚠️ stunnel CANNOT SEE THE pkcs11 PROVIDER WITHOUT A CONFIG SAYING SO. FastPKI's own
+        # binaries load it programmatically (ensure_pkcs11_provider, src/lib/x509.cpp);
+        # stunnel is a stock Alpine binary reading the stock openssl.cnf, which activates
+        # nothing. Scoped to this process by exporting OPENSSL_CONF right before the exec.
+        # ⚠️ pkcs11-module-path IS THE CLIENT SHIM, NEVER libsofthsm2.so — in-process SoftHSM
+        # re-enters libcrypto while it holds a lock and DEADLOCKS.
+        printf 'openssl_conf = c\n[c]\nproviders = p\n[p]\ndefault = d\npkcs11 = k\n[d]\nactivate = 1\n[k]\nmodule = %s/pkcs11.so\npkcs11-module-path = %s\nactivate = 1\n' \
+          "$${OSSL_MODULES_DIR:-/usr/lib/ossl-modules}" \
+          "$${PKCS11_MODULE:-/usr/lib/pkcs11/p11-kit-client.so}" > /tmp/stunnel-openssl.cnf
+        # ⚠️ THE PRIVATE KEY IS A TOKEN OBJECT. certgen mints `p11-server` in THIS node's
+        # token; a key file here would be the one private key in the deployment living
+        # outside a token.
+        printf 'foreground = yes\npid =\n\n[p11]\naccept = 0.0.0.0:12345\nconnect = /run/p11/pkcs11.sock\ncert = %s/server.crt\nkey = pkcs11:token=%s;object=p11-server;type=private?pin-source=%s\nCApath = %s/clients\nverifyPeer = yes\nverifyChain = yes\n' \
+          "$$D" "$${PKCS11_TOKEN:-fastpki}" "$${PKCS11_PIN_FILE:-/var/pki/tls/pin}" "$$D" > /tmp/stunnel.conf
+        # ⚠️ A PEER THAT PUBLISHES LATER MUST BE ADMITTED WITHOUT A RESTART. Everything above
+        # runs once, at start, so on a fresh pair the host that came up FIRST admits only
+        # itself — the other publishes its client certificate minutes later and nothing here
+        # re-reads it. `key sync` from that peer then fails in the TLS handshake with
+        # `certificate not found in local repository`, which the DIALLING side reports as
+        # `C_Initialize failed (rc=48)` — CKR_DEVICE_ERROR, naming nothing about certificates
+        # and sending the reader to the token PIN. certrenew re-syncs as well, but on ITS
+        # schedule: daily unless something already failed on THIS node, so the node that is
+        # merely serving has no reason to hurry and the pair can sit unconverged for a day.
+        #
+        # A refresh loop beside stunnel closes that. A peer's FIRST certificate needs no reload:
+        # `CApath` is looked up per handshake by hash, so a rehashed directory takes effect for
+        # the next connection. Failures are silent on purpose — the sync is best-effort, the
+        # previous contents stay valid, and a standby whose database is read-only can still READ.
+        #
+        # ⚠️ A REPLACED CERTIFICATE DOES NEED ONE. OpenSSL's hashed-directory lookup keeps a
+        # certificate in memory once loaded, and a peer's new certificate has the same subject,
+        # so the same hash, as the one it replaces. Measured on a Kubernetes pair: a host rebuilt
+        # with a new transport keypair was refused ("certificate not found in local repository")
+        # against the cached old certificate while its new one sat in clients/, so its empty
+        # token could never be refilled. A SIGHUP makes stunnel build its TLS context again.
+        ( while sleep 60; do
+            _before=$$(cat "$$D"/clients/*.crt 2>/dev/null | cksum)
+            fastpki-config --config /app/config/bootstrap.conf p11-clients-sync "$$D/clients" >/dev/null 2>&1 \
+              && openssl rehash "$$D/clients" >/dev/null 2>&1
+            fastpki-config --config /app/config/bootstrap.conf p11-servers-sync "$$D/servers" >/dev/null 2>&1 \
+              && openssl rehash "$$D/servers" >/dev/null 2>&1
+            [ "$$(cat "$$D"/clients/*.crt 2>/dev/null | cksum)" = "$$_before" ] \
+              || pkill -HUP -x stunnel 2>/dev/null
+          done ) &
+        echo "p11-tls: serving the token over mTLS on :12345 (clients pinned in $$D/clients)"
+        export OPENSSL_CONF=/tmp/stunnel-openssl.cnf
+        # ⚠️ STUNNEL RUNS AS THE TOKEN'S USER, NOT AS ROOT. Its `key =` is a pkcs11: URI, and
+        # the token container runs `p11-kit-server -u fastpki`, which authorises by the
+        # connecting process's credentials and serves that user alone. As root the handle
+        # cannot be opened and stunnel dies at startup with
+        #     [!] Service [p11]: Failed to initialize TLS context
+        #     [!] Configuration failed
+        # which names TLS configuration and not a uid, on a token every other container is
+        # using. This service is root only so the setup above can write into the root-owned
+        # /var/pki/tls/p11; stunnel itself needs no privilege — :12345 is unprivileged — so
+        # it drops here. Same cause as certgen's, fixed the same way. busybox setpriv cannot
+        # change uid, so this uses su.
+        exec su -s /bin/sh "$${P11_RUN_USER:-fastpki}" -c \
+             "OPENSSL_CONF=/tmp/stunnel-openssl.cnf exec stunnel /tmp/stunnel.conf"
+
+  # One-time transport-TLS setup. Runs automatically BEFORE postgres (which depends on
+  # it via service_completed_successfully), so a bare `docker compose up -d` provisions
+  # the cert with no manual step; idempotent (a still-valid cert is a no-op). Can also
+  # be run alone: `docker compose run --rm certgen`.
+  certgen:
+    <<: *fastpki
+    restart: "no"
+    user: "0:0"                     # writes the pg key owned by the postgres uid
+    # ⚠️ THE TOKEN, AND ONLY THE TOKEN. The shared depends_on is overridden because certgen
+    # must PRECEDE postgres — but under P11_TLS it mints the transport keypair as a token
+    # object, so the token has to be serving first. `token` has no DB dependency of its own,
+    # so this adds no cycle. With P11_TLS off, certgen makes no PKCS#11 call and the wait is
+    # merely harmless.
+    depends_on:
+      token:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/certgen.sh"]
+    environment:
+      PKI_DNS: ${PKI_DNS:-localhost}
+      # Names beyond the compose-internal ones that this database will be dialled by —
+      # a routable address a standby on another host uses. certgen puts them in the
+      # self-signed cert too, so a node can be joined before any CA exists.
+      PG_TLS_SANS: ${PG_TLS_SANS:-}
+      # This host's own address, as on every path: certgen names its self-signed database
+      # certificate after it, so the two hosts of a pair never present same-named anchors.
+      PG_BIND: ${PG_BIND:-}
+      # The token PIN install.sh generated. certgen writes it to
+      # /var/pki/tls/pin (0400, fastpki-owned); no other service sees the value —
+      # they are given PKCS11_PIN_FILE and read it off disk.
+      FASTPKI_PIN: ${FASTPKI_PIN:-}
+      # ⚠️ THIS BLOCK REPLACES THE *fastpki ANCHOR'S environment: — it does not merge with
+      # it. So the three the token needs are repeated here; without them certgen would look
+      # for a p11-kit socket that no variable names and mint nothing.
+      P11_KIT_SERVER_ADDRESS: unix:path=/run/p11/pkcs11.sock
+      PKCS11_MODULE: ${PKCS11_MODULE:-/usr/lib/pkcs11/p11-kit-client.so}
+      PKCS11_TOKEN: ${PKCS11_TOKEN:-fastpki}
+    volumes:
+      - ./certgen.sh:/certgen.sh:ro
+      - pki-data:/var/pki
+      - p11-socket:/run/p11
+
+  # One-time setup (dirs, EST/MS file user, default console admin). Not started by
+  # `up` (profile) — run it explicitly: `docker compose run --rm bootstrap`.
+  bootstrap:
+    <<: *fastpki
+    restart: "no"
+    profiles: ["setup"]
+    # runs as root: it creates the CA + TLS material in the fresh (root-owned)
+    # /var/pki volume, then hands ownership back to the unprivileged fastpki user.
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      PKI_DNS: ${PKI_DNS:-localhost}
+      PG_CONNINFO: >-
+        host=postgres port=5432 dbname=fastpki user=fastpki
+        password=${POSTGRES_PASSWORD:-fastpki} sslmode=verify-full
+        sslrootcert=/var/pki/tls/pg/ca.crt target_session_attrs=read-write connect_timeout=5
+      PKCS11_PIN_FILE: ${PKCS11_PIN_FILE:-/var/pki/tls/pin}
+      FASTPKI_PIN: ${FASTPKI_PIN:-}
+      # Which protocols this deployment was built with. install.sh writes these to
+      # .env; bootstrap.sh records them in `config` so the console and anything scheduling
+      # work can tell "never installed" from "switched off". Empty here (a deployment made
+      # before the wizard asked) is read as installed, which it is.
+      EST_INSTALLED: ${EST_INSTALLED:-}
+      ACME_INSTALLED: ${ACME_INSTALLED:-}
+      CMP_INSTALLED: ${CMP_INSTALLED:-}
+      SCEP_INSTALLED: ${SCEP_INSTALLED:-}
+      MS_INSTALLED: ${MS_INSTALLED:-}
+      STORE_INSTALLED: ${STORE_INSTALLED:-}
+    volumes:
+      - ./bootstrap.compose.conf:/app/config/bootstrap.conf:ro
+      - ./bootstrap.sh:/bootstrap.sh:ro
+      - pki-data:/var/pki
+
+  # DEPLOY ONLY WHAT THE CUSTOMER ASKED FOR. A protocol the customer chooses not to
+  # implement needs no container built, run or monitored — only what was chosen during the
+  # install.sh wizard is.
+  #
+  # Compose `profiles` say exactly that: a service carrying a profile is not created,
+  # started, restarted or listed unless its profile is active. install.sh writes the
+  # chosen set once, into .env as COMPOSE_PROFILES, so every later `docker compose up -d`
+  # / `pull` / `ps` — including rolling-update.sh — acts on that set without naming
+  # services by hand. No new tooling: profiles are core Compose (§3f: no new deps).
+  #
+  # ⚠️ `web` carries NO profile, deliberately: it is always created. A deployment without
+  # the console has nothing to administer the PKI with — no CA can be created, so no
+  # protocol could serve anything even if it were running.
+  web:   { <<: *fastpki, command: ["fastpki-web",   "--config", "/app/config/bootstrap.conf"], ports: ["8090:8090"] }
+  ocsp:  { <<: *fastpki, profiles: [ocsp],  command: ["fastpki-ocsp",  "--config", "/app/config/bootstrap.conf"], ports: ["8080:8080"] }
+  est:   { <<: *fastpki, profiles: [est],   command: ["fastpki-est",   "--config", "/app/config/bootstrap.conf"], ports: ["8443:8443"] }
+  acme:  { <<: *fastpki, profiles: [acme],  command: ["fastpki-acme",  "--config", "/app/config/bootstrap.conf"], ports: ["8444:8444"] }
+  cmp:   { <<: *fastpki, profiles: [cmp],   command: ["fastpki-cmp",   "--config", "/app/config/bootstrap.conf"], ports: ["8445:8445"] }
+  ms:    { <<: *fastpki, profiles: [ms],    command: ["fastpki-ms",    "--config", "/app/config/bootstrap.conf"], ports: ["8446:8446"] }
+  store: { <<: *fastpki, profiles: [store], command: ["fastpki-store", "--config", "/app/config/bootstrap.conf"], ports: ["8447:8447"] }
+  scep:  { <<: *fastpki, profiles: [scep],  command: ["fastpki-scep",  "--config", "/app/config/bootstrap.conf"], ports: ["8448:8448"] }
+
+  # Ships the audit trail to a collector (Splunk, or anything speaking syslog). Behind its
+  # own profile because a deployment that has not configured a collector should run nothing
+  # — and with AUDIT_FORWARD unset the process would exit immediately anyway.
+  #
+  # ⚠️ ONE PER NODE, AND THAT IS NOT A STYLE CHOICE. Every service on a node writes into the
+  # same node-local audit_log, and the shipper's position is a single row per destination.
+  # Two shipper replicas against one database would both read from the same mark and send
+  # the same rows twice. audit_log is NOT replicated between data centers (it is a per-node
+  # hash chain), so each node running exactly one shipper is what makes the collector's view
+  # complete without duplicates.
+  #
+  # --follow keeps it running; the interval and batch size come from the config.
+  auditfwd:
+    <<: *fastpki
+    profiles: [auditfwd]
+    command: ["fastpki-audit", "--config", "/app/config/bootstrap.conf", "forward", "--follow"]
+
+  # Reissue the credentials FastPKI holds for ITSELF — the OCSP responder,
+  # the CMP RA and the SCEP RA. Nothing renewed them before, so each went
+  # dark, silently, on the day it expired; a delegated responder is the sharp case,
+  # because it carries id-pkix-ocsp-nocheck precisely so clients do NOT check it.
+  #
+  # cron was chosen as the trigger — it is standard and runs inside a container
+  # perfectly well — so this is the ordinary CLI on a schedule, not a
+  # timer inside each protocol binary. The renewal threshold is a fraction of each
+  # certificate's own lifetime (SERVICE_CERT_RENEW_FRACTION, default 3/4), so the daily
+  # tick is a polling interval, not the renewal interval.
+  #
+  # ⚠️ This runs on EVERY node of a replicated mesh, which is safe only because it is
+  # idempotent and takes a Postgres advisory lock: whoever gets there first renews, the
+  # others print "another node is already renewing" and exit 0. Without that lock all
+  # three would read the same certificate, all issue, and all insert — two live
+  # certificates under one cert_id, which is what made a healthy lab responder answer
+  # "Response Verify Failure".
+  certrenew:
+    <<: *fastpki
+    # ⚠️ THIS LIST REPLACES THE ANCHOR'S, it does not merge with it — so the two the anchor
+    # supplied are repeated here beside the one this service adds. certgen.sh is mounted
+    # because the transport-certificate renewal below re-runs it; without the mount that
+    # branch fails every night with "not found" and the tunnel expires anyway.
+    volumes:
+      - ./bootstrap.compose.conf:/app/config/bootstrap.conf:ro
+      - pki-data:/var/pki
+      - p11-socket:/run/p11
+      - ./certgen.sh:/certgen.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # ⚠️ --create-missing, OR A DEPLOYMENT NEVER GETS ITS RA CREDENTIALS AT ALL.
+        # Bare renew-service-certs only refreshes credentials that already exist, and on a
+        # fresh deployment none do: the CAs are created in the console AFTER install, and
+        # nothing then mints the OCSP responder, CMP RA and SCEP RA certificates. The
+        # listeners refuse every transaction until someone runs this by hand —
+        #   CMP: refusing the transaction — no RA credential
+        # — which is a runbook step nobody knows to take. --re-issue-self-signed is the
+        # other half: transport certs minted before a CA existed are self-signed, and this
+        # replaces them with CA-issued ones once there is a CA to sign with. Both are
+        # idempotent and both are no-ops until a signing CA exists.
+        #
+        # ⚠️ AND THE TOKEN TRANSPORT'S OWN PAIR, WHICH renew-service-certs DOES NOT COVER.
+        # Those two certificates are self-signed and PINNED, so they are not `certs` rows
+        # and the sweep never sees them; their only renewal is certgen running again.
+        # `--p11-only` re-enters its P11_TLS block alone, which re-issues each certificate
+        # once it is within SELFSIGNED_RENEW_DAYS of expiry and is a no-op before that. The
+        # key is untouched — it stays a token object — so only the certificate changes, and
+        # republishing is what carries it to the peers that pin it.
+        while :; do
+          SOON=0
+          CREATE=--create-missing
+          # ⚠️ KEYS FIRST, THEN THE SWEEP. When a credential's row exists and its key is not in
+          # this token, `renew-service-certs --create-missing` mints a replacement — the remedy
+          # for a host nothing can copy the key to. Run before the sync, it was the ordinary
+          # state of a pair: the second host replaced every credential the first had just made,
+          # the first replaced them back on its next pass, and each night one host's OCSP, CMP
+          # and SCEP had keys only the other held. So the sync runs first and the sweep may mint
+          # only when the sync says no retry can help: 0 (nothing missing), 2 (never
+          # replicable), 3 (nobody to copy from).
+          if [ "$${P11_TLS:-off}" = "on" ]; then
+            if sh /certgen.sh --p11-only; then
+              fastpki-config --config /app/config/bootstrap.conf p11-server-publish || \
+                echo "could not publish this node's transport server certificate"
+              fastpki-config --config /app/config/bootstrap.conf p11-client-publish || \
+                echo "could not publish this node's transport client certificate"
+              fastpki-config --config /app/config/bootstrap.conf p11-clients-sync >/dev/null 2>&1 || true
+              fastpki-config --config /app/config/bootstrap.conf p11-servers-sync >/dev/null 2>&1 || true
+              # ⚠️ AND THE KEYS THEMSELVES, FROM EVERY OTHER HOST OF THIS DATA CENTER. A pair
+              # shares one database, so every CA and credential ROW reaches both hosts through
+              # streaming replication the moment it is created — and no KEY ever does. A key is
+              # minted in the token of whichever host created it, and that is either one: the
+              # console behind the pair's one address serves New CA from whichever host the
+              # balancer picked, and the sweep below mints missing credentials on whichever host
+              # took its lock. Syncing only standby-from-primary left a key minted on the
+              # standby out of the primary's token for ever.
+              #
+              # Ordered AFTER the trust sync above deliberately: `key sync` dials the other
+              # host's token over the mTLS tunnel, and the certificate that admits it is what
+              # those two lines just materialised. Reversed, a fresh host's first run fails.
+              #
+              # ⚠️ --from-peers IS SCOPED TO THIS DATA CENTER, which is what keeps a mesh safe:
+              # in a mesh a replicable CA is opt-in precisely to bound blast radius, so a node
+              # must not help itself to another data center's keys, and fastpki-ca never asks
+              # one. A single host with no peer has nothing missing and dials nothing.
+              SRCPIN=""
+              # The other host's token PIN, if the two hosts were given different ones.
+              # ha-join.sh installs it here; with a shared PIN there is no file and `key sync`
+              # falls back to this node's own, which is then the same value.
+              [ -f /var/pki/tls/srcpin ] && SRCPIN="--source-pin-file /var/pki/tls/srcpin"
+              fastpki-ca --config /app/config/bootstrap.conf key sync --from-peers $$SRCPIN
+              # ⚠️ 2 AND 3 MEAN STOP ASKING. Exit 1 is an ordinary failure — the peer was
+              # restarting, the trust had not landed yet — and is worth retrying shortly, with
+              # nothing re-minted meanwhile. Exit 2 is a key created without --replicable, which
+              # can never leave the token it was made in, and 3 is a host with nobody to copy
+              # from; retrying either every five minutes would print the same line forever.
+              case $$? in
+                0|2|3) ;;
+                *) SOON=1; CREATE=""
+                   echo "key sync did not complete — until it does, losing the other host of" \
+                        "this pair can leave this one unable to sign, and no credential is" \
+                        "re-minted here" ;;
+              esac
+            else
+              CREATE=""
+              echo "the token transport certificates are not being renewed — once they" \
+                   "expire the mTLS tunnel stops handshaking"
+            fi
+          fi
+          fastpki-ca --config /app/config/bootstrap.conf renew-service-certs \
+              $$CREATE --re-issue-self-signed || \
+            echo "renew-service-certs failed (rc=$$?) — retrying at the next tick"
+          # ⚠️ THE DATABASE'S OWN CERTIFICATE NEEDS NO CALL HERE, and putting one back would
+          # be a step backwards. The renew-service-certs run above
+          # maintains it: pki::maintain_pg_tls is part of that sweep rather than a command of
+          # its own. While it WAS a command of its own this was the only renewer of the three
+          # that called it at all, and even here it sat inside the P11_TLS branch — which is
+          # off unless asked for — so on the default shape the database certificate was
+          # issued once by hand and then expired with nothing to replace it. That re-homes
+          # every application onto a certificate nothing can verify, against a database that
+          # is up and read-write, with the CLIs sharing that conninfo and failing too.
+          #
+          # A credential the sweep owns cannot be forgotten by a renewer that runs the sweep,
+          # and the database certificate adds no ordering of its own: the sweep follows the key
+          # sync for the credentials' sake (above), not for this. PG_TLS_CA_ID still names the
+          # CA and is still never guessed — unset, the sweep leaves the database alone.
+          # ⚠️ A DAY IS THE WRONG RETRY FOR A STANDBY THAT CANNOT SIGN. Certificate renewal
+          # is genuinely daily work, but a key sync that failed leaves this host unable to
+          # take over, and waiting until tomorrow to try again is the difference between a
+          # transient peer restart and a day without redundancy.
+          if [ "$$SOON" = 1 ]; then sleep 300; else sleep 86400; fi
+        done
+
+volumes:
+  pki-data:
+  pgdata:
+  p11-socket:          # the SoftHSM container's p11-kit server socket. NOT optional --
+                       # the token service carries no `profiles:` key, so it starts by
+                       # default, and a CA private key can ONLY be a pkcs11
+                       # handle. There is no profile to enable and nothing works without it.
+  softhsm-tokens:      # the SoftHSM token store (the CA key lives here)

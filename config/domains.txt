@@ -1,0 +1,12 @@
+# Approved domain suffixes for certificate issuance (one per line).
+# A requested CN / DNS SAN must fall under one of these suffixes, per the
+# check_cn policy ported from the PHP server. Lines starting with # are
+# comments; blank lines are ignored.
+#
+#   standard role: plain labels only (no wildcards)
+#   master   role: may request wildcard (*) labels
+#
+# Unqualified names (no dot) are always allowed; the ACME path bypasses this
+# allowlist because it performs its own domain validation.
+internal
+local

@@ -1,0 +1,66 @@
+#!/sbin/openrc-run
+# deployment-path: native and cloud only — a container gets a fresh /run on every start, so
+# Compose and Kubernetes cannot reach this state at all.
+#
+# Clear a PostgreSQL socket file that outlived its server, before PostgreSQL starts.
+#
+# ⚠️ WHY THIS EXISTS. When the kernel kills the postmaster — an out-of-memory kill is the
+# way it happens here — the socket file in /run/postgresql stays behind. Alpine's
+# postgresql init script then refuses to start, because its only test is whether that file
+# EXISTS:
+#
+#     Socket conflict. A server is already listening on:
+#         /run/postgresql/.s.PGSQL.5432
+#     Hint: Change 'port' to listen on a different socket.
+#
+# Nothing is listening. The node has a database it cannot start, and the message sends the
+# operator looking for a second server that does not exist. Measured on both nodes of a
+# two-data-center deployment after their postmasters were OOM-killed: no postgres process,
+# an empty process table as far as postgres was concerned, and the socket and its .lock
+# still sitting in /run/postgresql. Removing the two files was the whole repair.
+#
+# ⚠️ WHAT MAKES IT SAFE. A socket file with a LIVE server behind it must never be removed —
+# that would cut every client off from a healthy database. So this refuses to act unless
+# both tests agree the server is gone:
+#
+#   1. pg_isready cannot get an answer, and
+#   2. no process called postgres exists.
+#
+# Either one alone is not enough. pg_isready fails during startup too, and a postmaster can
+# exist while still refusing connections.
+
+description="Removes a PostgreSQL socket file left behind by a killed server"
+
+depend() {
+	before postgresql
+	need localmount
+}
+
+: "${PG_SOCKET_DIR:=/run/postgresql}"
+
+start() {
+	# Nothing to do when the directory has no sockets in it, which is the normal case on a
+	# clean boot: /run is a tmpfs and starts empty.
+	set -- "$PG_SOCKET_DIR"/.s.PGSQL.*
+	[ -e "$1" ] || return 0
+
+	if su postgres -s /bin/sh -c 'pg_isready -q' 2>/dev/null; then
+		veinfo "PostgreSQL is answering; leaving its socket alone"
+		return 0
+	fi
+
+	# busybox ps, so no -C. Match the command name exactly rather than grepping a line that
+	# would also match this script's own pipeline.
+	if ps -o comm 2>/dev/null | grep -qx postgres; then
+		veinfo "a postgres process exists; leaving its socket alone"
+		return 0
+	fi
+
+	ebegin "Removing PostgreSQL socket files left by a server that is gone"
+	rm -f "$PG_SOCKET_DIR"/.s.PGSQL.*
+	eend $? "could not remove the stale socket files in $PG_SOCKET_DIR"
+}
+
+stop() {
+	return 0
+}

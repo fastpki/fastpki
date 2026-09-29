@@ -1,0 +1,36 @@
+# ONE server's token transport, published to the PEER clusters. apply.sh renders this once per
+# server, with NODE_ORDINAL set, when P11_TLS=on and P11_TLS_SERVICE_TYPE is LoadBalancer or
+# NodePort.
+#
+# Inside this cluster the servers reach each other's tokens through the headless `fastpki-node`
+# Service (fastpki-node-N.fastpki-node:12345) and need nothing here. This is for a peer DATA CENTER that
+# replicates a CA key out of this cluster's tokens — Scenario B, one sub CA present in every data
+# center (docs/architecture.md §7). It is never so a peer can sign with this token: every node
+# signs from its own.
+#
+# ⚠️ C_LOGIN CROSSES THIS LINK, carrying the PIN that protects every CA key in the token, and
+# client-certificate verification is the only thing between the network and every CA. Peer it
+# privately, as the database interconnect beside it.
+#
+# One per server, for the same reason as postgres-external: the key a peer needs may have been
+# created on either server, and each has its own token.
+#
+# Each on its own port, 12345 + the server's ordinal (apply.sh sets P11_TLS_EXTERNAL_PORT), for
+# the same reason as postgres-external: a load balancer that publishes on the machines' own
+# addresses cannot publish two Services on one port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastpki-p11-tls-$NODE_ORDINAL
+  labels:
+    app.kubernetes.io/name: fastpki
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: p11-tls
+spec:
+  type: $P11_TLS_SERVICE_TYPE
+  selector:
+    app.kubernetes.io/instance: fastpki
+    app.kubernetes.io/component: node
+    statefulset.kubernetes.io/pod-name: fastpki-node-$NODE_ORDINAL
+  ports:
+    - { name: p11-tls, port: $P11_TLS_EXTERNAL_PORT, targetPort: 12345 }

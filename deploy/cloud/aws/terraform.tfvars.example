@@ -1,0 +1,80 @@
+# Copy to terraform.tfvars and edit, or let deploy/cloud/cloud-install.sh write it.
+#
+# There are no secrets here and there must not be: each node generates its own database
+# password and token PIN from the kernel CSPRNG at first boot, so neither this file nor
+# the Terraform state ever holds one.
+
+deployment_name = "fastpki"
+region          = "us-east-1"
+pki_dns         = "pki.example.org"
+
+# 1 = a single node, no mesh. 3 = the tested topology, one node per availability zone.
+# Each node mints certificate serials under a 2-octet prefix that is its own, so two nodes
+# can never produce the same serial.
+dc_count = 3
+
+# Blank starts the servers from Alpine's own image, and each installs FastPKI at first boot
+# from fastpki.com after checking the release signature. Set it to an image built with
+# deploy/cloud/image only when the servers cannot reach the internet at first boot:
+#   packer build -only=fastpki.amazon-ebs.alpine -var 'release=vX.Y.Z' deploy/cloud/image
+ami_id = ""
+
+# The release every server installs, e.g. "vX.Y.Z". Blank takes the newest at each server's
+# first boot — pin it if you will add servers later, or they can end up on a newer release.
+fastpki_version = ""
+
+# ⚠️ WHICH ACCOUNT MAY BE TOUCHED. AWS credentials are ambient — a profile, an environment
+# variable, an instance role — so without this the account is whichever one the shell was
+# carrying when the apply ran, and the plan does not say which. Anyone with two accounts
+# will eventually aim this at the wrong one. `aws sts get-caller-identity --query Account
+# --output text` prints yours. Empty disables the check.
+allowed_account_id = "123456789012"
+
+instance_type  = "t4g.medium"
+data_volume_gb = 40
+
+# Data centers that get a SECOND machine, standing by to take over from the first. Empty is
+# one machine per data center. [1] gives data center 1 a standby; [1, 2] gives both one.
+#
+# ⚠️ A standby can only ever hold a CA key that was created replicable, and that is fixed
+# when the key is generated — see docs/deployment.md §12 step 7. The module provisions the
+# machine; joining it to its primary is docs/high-availability.md §3.
+standby_dcs = []
+
+# ⚠️ REQUIRED. Who may reach SSH and the console (8090). This is the administrative
+# interface of a certificate authority; there is deliberately no default. The two address
+# families may be mixed — each prefix becomes a rule of its own family.
+admin_cidrs = ["203.0.113.4/32", "2001:db8:1234::/48"]
+
+# Who may reach the enrolment protocols and OCSP/CRL. Empty = nobody outside the VPC.
+# A production deployment usually opens OCSP/CRL broadly, because relying parties have to
+# reach them — that is a decision, so it is a variable.
+client_cidrs = []
+
+enabled_protocols = ["est", "acme", "cmp", "scep", "ms", "store"]
+
+# softhsm = the bundled software token (demo posture).
+# hsm     = your own PKCS#11 module, e.g. CloudHSM. This module does not provision a
+#           CloudHSM cluster; point it at one you already run.
+key_backend   = "softhsm"
+pkcs11_module = ""
+pkcs11_token  = "fastpki"
+
+# Each service's key, as the install wizard asks for it. Left out = ec / P-256, and RSA 3072
+# for the SCEP RA.
+service_keys = {
+  # WEB_KEY_ALGO     = "rsa"
+  # WEB_KEY_BITS     = "3072"
+  # SCEP_RA_KEY_BITS = "4096"
+}
+
+ssh_key_name    = ""
+route53_zone_id = ""
+
+# Every node gets a public IPv6 address, which is free. This adds a public IPv4 one as
+# well, at $0.005/hour each — charged while the instance is stopped, and while the address
+# is merely allocated. Set it false only when every administrator, enrolment client and
+# relying party can reach the nodes over IPv6; the nodes keep their private IPv4 addresses
+# either way, so the metadata service, the interconnect and the mesh conninfos do not
+# change. With it false, route53_zone_id is how anyone finds the deployment.
+public_ipv4 = true
